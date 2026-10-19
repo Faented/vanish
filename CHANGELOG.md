@@ -5,6 +5,7 @@
 ## Unreleased
 
 ### Добавлено
+- Документация `README.md`: полный цикл сборки/упаковки (`scripts/build-release.sh` + UPX + `SHA256SUMS`), руководство пользователя (режимы wipe/check/freespace/device/recovery/selfcheck, флаги, коды выхода, политики отказа, приватность отчёта).
 - **Крипто-интегрити сборки**: `scripts/build-release.sh` — release-сборка + (опционально) упаковщик UPX (`--best --lzma`) + манифест `SHA256SUMS`, считаемый по финальному (уже упакованному) бинарю. Рантайм-проверка: `vanish --selfcheck [MANIFEST]` — пересчитывает SHA-256 живого exe и сверяет с манифестом. Коды: 0=verified, 1=tampered (хэш не совпал), 2=манифест не найден, 4=ошибка. Манифест ищется: аргумент → `VANISH_SHA256SUMS` → рядом с exe.
 - Юнит-тесты selfcheck (2): известный вектор SHA-256 + матрица ok/tamper/absent. Батарея: 11/11.
 
