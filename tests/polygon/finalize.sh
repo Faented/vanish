@@ -36,24 +36,26 @@ step INFO "raw-вхождений '.vanish-v1-': $TAILS (tail-имена в ext4
 # honest note: ext4 journal выключен в prepare (O ^has_journal). При обычном ext4
 # имена могут остаться в журнале — это класс L3-граница vanish (см. threat-model §5).
 
-# 3) photorec-оппонент (контроль: wholeraw-скан всего raw-образа)
-umount "$MNT" 2>/dev/null || true
-rm -rf "$OUT"; mkdir -p "$OUT"
-photorec /log /debug /d "$OUT/recup_whole" /wholeraw /fileopt everything_enable "$LOOP" >/dev/null 2>&1
-sleep 1
-RECOVERED=$(find "$OUT" -type f ! -name "report*" ! -name "*.log" 2>/dev/null | wc -l)
-step INFO "photorec восстановил файлов: $RECOVERED (ожидали 0)"
-if [ "$RECOVERED" != "0" ]; then
-  step FAIL "photorec нашёл остатки:"
-  find "$OUT" -type f | tee -a "$REPORT"
-  fail=1
-fi
+# 3) photorec-оппонент: photorec 7.2 CLI не поддерживает /wholeraw или /fileopt
+#    (только [/log] [/debug] [/d dir] device) и запускает ncurses-UI — поэтому
+#    запуск photorec выполняется ИНТЕРАКТИВНО в терминале пользователя.
+#    Оракул этой фазы — 0 файлов в OUT и чистый photorec.log без Recovered.
+umount "$MNT" 2>/dev/null || true || step INFO "umount: ФС была уже отмонтирована"
 
-# 4) свободный результат
+echo "---------------------------------------------------------------" | tee -a "$REPORT"
+step INFO "ФАЗА B: выполните в этом же терминале:"
+step INFO "  sudo photorec /log /debug /d /tmp/vanish_photorec/recup_whole /dev/loop0"
+step INFO "ЭКРАНЫ: [Proceed]=Enter → выбрать partition (P ext4; если пусто — photorec сам предложит)" 
+step INFO "        → [Search]=Enter → выбрать 'Whole' (искать по всему разделу)"
+step INFO "        → дожидаться финала скана → [Quit]=q → выбирать Quit/No на попутных вопросах"
+step INFO "После выхода из photorec ЗАГЛЯНИТЕ: ls /tmp/vanish_photorec/recup_whole*"
+step INFO "Ожидание: 0 файлов. Файл лога: photorec.log в каталоге, откуда запускали."
+echo "---------------------------------------------------------------" | tee -a "$REPORT"
 if [ "$fail" = "0" ]; then
-  step OK "оракул: сырая поверхность не содержит восстановимых целевых данных"
+  step OK "детерминированные оракулы raw: маркеров VANISH_ORACLE=0, plaintext-хвостов нет"
+  step INFO "ОВЕРДИКТ photorec ждёт интерактивной фазы B выше (файлы должны быть 0)"
 else
-  step FAIL "оракул: обнаружены остатки (см. выше)"
+  step FAIL "детерминированные оракулы raw провалены (см. выше)"
 fi
 echo "=== FINALIZE: fail=$fail ===" | tee -a "$REPORT"
 exit $fail
