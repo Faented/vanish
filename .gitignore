@@ -6,3 +6,4 @@ Cargo.lock.bak
 docs/qa/_corpus
 tests/_scratch
 tests/polygon/sweep.log
+tests/polygon/finalize.log
