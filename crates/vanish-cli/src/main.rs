@@ -75,6 +75,10 @@ struct Cli {
     yes: bool,                 // для device-режима: авто-yes
     #[arg(long)]
     recovery_scan: bool, // альтернатива subcommand
+    /// самоверификация бинаря: SHA-256 текущего exe против манифеста SHA256SUMS
+    /// (поиск: аргумент → env VANISH_SHA256SUMS → рядом с exe).
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "MANIFEST")]
+    selfcheck: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -457,8 +461,57 @@ fn recovery_mode(roots: Vec<PathBuf>, cli: &Cli, opts: &mut Options) -> u8 {
 
 const ENOSPC: i32 = 28; // linux errno: no space left on device
 
+/// Коды выхода selfcheck: 0=verified, 1=TAMPERED (хэш не совпал),
+/// 2=манифест не найден, 4=ошибка выполнения проверки.
+fn selfcheck_mode(manifest_arg: Option<&str>) -> u8 {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("selfcheck: не могу определить путь бинаря: {}", e);
+            return 4;
+        }
+    };
+    let explicit = match manifest_arg {
+        Some("") | None => None,
+        Some(p) => Some(Path::new(p)),
+    };
+    let man = match vanish_core::selfcheck::resolve_manifest(&exe, explicit) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "selfcheck: манифест SHA256SUMS не найден. Укажите путь: --selfcheck <SHA256SUMS> (собирается scripts/build-release.sh)"
+            );
+            return 2;
+        }
+    };
+    match vanish_core::selfcheck::check(&exe, &man) {
+        Ok(true) => {
+            println!("[ok] selfcheck: SHA-256 бинаря совпадает с манифестом ({})", man.display());
+            0
+        }
+        Ok(false) => {
+            println!(
+                "[tampered] selfcheck: ХЭШ БИНАРЯ НЕ СОВПАДАЕТ с манифестом ({}) — \
+                 бинарь изменён после сборки; не используйте в защищённых задачах",
+                man.display()
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!("selfcheck: {}", e);
+            4
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Самоверификация бинаря — до остальной логики.
+    if cli.selfcheck.is_some() {
+        return ExitCode::from(selfcheck_mode(cli.selfcheck.as_deref()));
+    }
+
     let opts = match cli.opts() {
         Ok(o) => o,
         Err(e) => {

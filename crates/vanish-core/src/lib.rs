@@ -13,6 +13,7 @@ pub mod pipeline;
 pub mod platform;
 pub mod recovery;
 pub mod report;
+pub mod selfcheck;
 pub mod signal;
 pub mod strategy;
 pub mod util;
