@@ -1,0 +1,20 @@
+# Нормализация строк: в репо хранится только LF (никаких CRLF-фантомов от Windows/macOS).
+* text=auto eol=lf
+
+# Явно бинарное (даже если git ошибётся эвристикой)
+*.img  binary
+*.raw  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
+
+# Cargo.lock: разрешаем мердж-апиблированный конфликт (файлы lock-формата без ручных правок)
+Cargo.lock merge=union
+
+# Release-архивы (git archive / "Download ZIP"): dev-окружение в tarball не попадает
+docs/**        export-ignore
+tests/**       export-ignore
+.githooks/**   export-ignore
+
+# Приватность: идентичность коммитов задаётся GitHub-noreply-почтой
+# (см. scripts/setup-git.sh) — личный ящик не попадает в историю.

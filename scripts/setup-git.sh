@@ -79,5 +79,11 @@ git config core.autocrlf input
 git config diff.renames true
 git config core.whitespace trailing-space,space-before-tab
 
+# pre-commit-барьер утечек (если в репо есть .githooks)
+if [ -d "$ROOT/.githooks" ]; then
+  git config core.hooksPath .githooks
+  info "подключены локальные хуки: .githooks"
+fi
+
 info "локальный конфиг настроен: $ROOT"
 git config --local --list | sed 's/^/  /'

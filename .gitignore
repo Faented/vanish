@@ -1,9 +1,53 @@
-/target
+# ===== vanish: gitignore правильного вида =====
+# Принцип: в истории живут только исходники и документация.
+# Всё, что можно получить демоном/билдом/прогоном теста, в git не попадает.
+
+# ---- Rust: сборка и артефакты ----
+/target/
+**/target/
 Cargo.lock.bak
-*.tmp
+
+# ---- vanish: полигонные и QA-артефакты ----
+tests/polygon/*.log
+tests/_scratch/
+docs/qa/_corpus/
 *.img
 *.raw
-docs/qa/_corpus
-tests/_scratch
-tests/polygon/sweep.log
-tests/polygon/finalize.log
+# tail-имена wipe-конвейера — это мусор политестов, не исходники
+.vanish-v1-*
+
+# ---- секреты и ключи (скомпрометируются мгновенно, даже 1 файл) ----
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+# публичные ключи не секрет
+!*.pub
+# легитимная фикстура (тестовые данные) добавляется только осознанно:
+#   git add -f path/to/fixture.key
+
+# ---- логи ( область .log свободна, кроме срезанных QA-логов ) ----
+*.log
+!docs/qa/artifacts/*.log
+
+# ---- дампы и временные файлы ----
+*.tmp
+*.core
+/core
+core.*
+*.bak
+*.swp
+*.orig
+
+# ---- ОС / IDE / редакторы ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.sublime-*
