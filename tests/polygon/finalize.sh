@@ -21,18 +21,18 @@ if [ -z "$LOOP" ] || [ ! -b "$LOOP" ]; then step FAIL "нет loop-устрой�
 sync
 echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
-# 1) plaintext-маркеры содержимого на raw-девайсе?
-#    прогоны в run_sweep писали /dev/urandom — ищем устойчивые маркеры,
-#    которые против возможно остались от ТЕСТОВ ДО wipe (созданы вручную ниже нет).
-#    Здесь контролируем: количество исполняемых байт-паттернов из известного мусор:
-RAW_SIG_COUNT=$(grep -c "VANISH_ORACLE" "$LOOP" || true)
-step INFO "raw-сигнатур 'VANISH_ORACLE': $RAW_SIG_COUNT (ожидание: 0 после успешных прогонов с маркером)"
-# создаём контроль: если пользователь создал в m1 файл со строкой маркера ДО wipe —
-# только тогда эта проверка показательна. В базовом sweep маркер не заливался.
+# 1) проверка-1, маркеры содержимого: кейс 6 (run_sweep) зашил VANISH_ORACLE
+#    в каждый 16КБ-офсет 1МБ-файла ДО wipe. Значит одно вхождение на raw = wipe пропустил область.
+RAW_SIG_COUNT=$(grep -a -c "VANISH_ORACLE" "$LOOP" || true)
+step INFO "raw-вхождений 'VANISH_ORACLE': $RAW_SIG_COUNT (ожидали 0)"
+if [ "$RAW_SIG_COUNT" != "0" ]; then
+  step FAIL "wipe пропустил область: маркеры VANISH_ORACLE выжили на raw ($RAW_SIG_COUNT)"
+  fail=1
+fi
 
-# 2) имена-хвосты (plaintext этому девайсу)? ищем '.vanish-v1-' строки
+# 2) проверка-2, имена-хвосты: ищем строки '.vanish-v1-'.
 TAILS=$(grep -a -c "\.vanish-v1-" "$LOOP" || true)
-step INFO "raw-вхождения '.vanish-v1-': $TAILS (ext4-директории могут хранить упоминания имён ДО rename-hide — деталь ниже)"
+step INFO "raw-вхождений '.vanish-v1-': $TAILS (tail-имена в ext4-метаданных допустимы, не FAIL; vanish не пишет оригинальные имена)"
 # honest note: ext4 journal выключен в prepare (O ^has_journal). При обычном ext4
 # имена могут остаться в журнале — это класс L3-граница vanish (см. threat-model §5).
 

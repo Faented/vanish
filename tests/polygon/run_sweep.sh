@@ -50,6 +50,21 @@ expect 0 "4: дерево rc" "$V" "$MNT/tree"
 head -c 65536 /dev/urandom > "$MNT/nr.bin"
 expect 0 "5: no-rename rc" "$V" --no-rename "$MNT/nr.bin"
 
+# 6) маркер-кейс: делает raw-оракул в finalize ОСМЫСЛЕННЫМ.
+#    Каждые 16КБ-офсет файла содержат строку-маркер поверх случайных данных;
+#    после wipe маркеров не должно остаться на сыром устройстве:
+#    если хоть один блок не перезатёрт — finalize обязан выдать FAIL.
+head -c 1048576 /dev/urandom > "$MNT/marker.bin"
+for off in $(seq 0 16384 1048575); do
+  printf "VANISH_ORACLE@%08x" "$off" | dd of="$MNT/marker.bin" bs=1 seek="$off" conv=notrunc status=none 2>/dev/null
+done
+sync
+# Пока файл жив, проверяем, что маркер реально записался (оракул не пустышка):
+if ! grep -qa "VANISH_ORACLE@00010000" "$MNT/marker.bin"; then
+  step FAIL "6: маркер не записан в файл (оракул был бы пустышкой)"; fail=1
+fi
+expect 0 "6: маркер-файл rc" "$V" "$MNT/marker.bin"
+
 sync
 
 echo "=== SWEEP DONE: fail=$fail ===" | tee -a "$LOG"
