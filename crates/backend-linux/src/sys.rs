@@ -231,7 +231,8 @@ struct Fiemap {
     fm_start: u64,
     fm_length: u64,
     fm_flags: u32,
-    fm_extent_count: u32,
+    fm_mapped_extents: u32, // выход ядра: сколько экстентов заполнено
+    fm_extent_count: u32,   // вход: ёмкость буфера
     fm_reserved: u32,
 }
 
@@ -259,6 +260,7 @@ pub fn fiemap(fd: i32) -> io::Result<Option<Vec<(u64, u64)>>> {
             fm_start: start,
             fm_length: SIZE_MAX,
             fm_flags: 0,
+            fm_mapped_extents: 0,
             fm_extent_count: FIEMAP_MAX_EXTENTS as u32,
             fm_reserved: 0,
         };
@@ -296,7 +298,11 @@ pub fn fiemap(fd: i32) -> io::Result<Option<Vec<(u64, u64)>>> {
             header = std::ptr::read(blob.as_ptr() as *const Fiemap);
             exts = std::ptr::read(blob.as_ptr().add(hdr_size) as *const [FiemapExtent; FIEMAP_MAX_EXTENTS]);
         }
-        let got = header.fm_extent_count as usize;
+        let got = header.fm_mapped_extents as usize;
+        if got > FIEMAP_MAX_EXTENTS {
+            // Ядро не должно отдавать больше, чем запрошено.
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
         if got == 0 {
             break;
         }
@@ -305,7 +311,12 @@ pub fn fiemap(fd: i32) -> io::Result<Option<Vec<(u64, u64)>>> {
             // EXTENT_EOF бит 9? IEEE: FIEMAP_EXTENT_LAST = 0x0001; skip hole flags 0x0004
             let last = ext.fe_flags & 0x0001 != 0;
             result.push((ext.fe_logical, ext.fe_length));
-            start = ext.fe_logical + ext.fe_length;
+            let next = ext.fe_logical + ext.fe_length;
+            if next <= start {
+                // Прогресса нет (ноль-экстент/повтор) — чтобы не зависнуть, стоп с ошибкой.
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
+            start = next;
             if last {
                 return Ok(Some(result));
             }

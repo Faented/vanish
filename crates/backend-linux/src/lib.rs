@@ -338,6 +338,8 @@ mod wipe_handle {
         pub fd_buf: Fd,
         pub abs_path: PathBuf,
         pub buf: vanish_core::aligned::AlignedBuf,
+        /// Отдельный выровненный буфер чтения (O_DIRECT требует выравнивания и юзер-буфера).
+        pub verify_buf: vanish_core::aligned::AlignedBuf,
         pub len: u64,
         pub dev: u64,
         pub ino: u64,
@@ -361,6 +363,7 @@ mod wipe_handle {
                 fd_buf: Fd(buf_open),
                 abs_path: t.abs.clone(),
                 buf: vanish_core::aligned::AlignedBuf::zeroed(vanish_core::aligned::CHUNK),
+                verify_buf: vanish_core::aligned::AlignedBuf::zeroed(vanish_core::aligned::CHUNK),
                 len: size,
                 dev,
                 ino: t.ino,
@@ -434,14 +437,20 @@ mod wipe_handle {
             while pos < end {
                 let n = chunk.min(end - pos) as usize;
                 let fd = self.pick_fd(pos, n, true);
-                let mut raw = vec![0u8; n];
-                s::pread_at(fd, &mut raw, pos).map_err(VanishError::Io)?;
+                // Читаем в выровненный буфер: при O_DIRECT юзер-буфер тоже должен быть выровнен.
+                {
+                    let raw = self.verify_buf.as_mut();
+                    s::pread_at(fd, &mut raw[..n], pos).map_err(VanishError::Io)?;
+                }
                 {
                     let buf = self.buf.as_mut();
                     gen.fill(&mut buf[..n]);
                 }
-                if raw.as_slice() != &self.buf[0..n] {
-                    return Err(VanishError::VerifyMismatch { offset: pos });
+                {
+                    let raw_cmp = self.verify_buf.as_mut();
+                    if &raw_cmp[..n] != &self.buf[0..n] {
+                        return Err(VanishError::VerifyMismatch { offset: pos });
+                    }
                 }
                 pos += n as u64;
             }

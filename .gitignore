@@ -5,3 +5,4 @@ Cargo.lock.bak
 *.raw
 docs/qa/_corpus
 tests/_scratch
+tests/polygon/sweep.log
