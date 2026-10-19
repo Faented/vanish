@@ -474,7 +474,7 @@ fn main() -> ExitCode {
         Some(Cmd::Recovery { roots }) => recovery_mode(roots.clone(), &cli, &mut opts),
         None => {
             if cli.recovery_scan {
-                recovery_mode(Vec::new(), &cli, &mut opts)
+                recovery_mode(cli.targets.clone(), &cli, &mut opts)
             } else if cli.targets.is_empty() {
                 eprintln!("vanish: укажите цели (или используйте 'check'/'freespace'/'device'/'recovery-scan')");
                 2
