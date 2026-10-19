@@ -1,0 +1,70 @@
+Using locale 'LC_CTYPE=en_US.UTF-8;LC_NUMERIC=ru_RU.UTF-8;LC_TIME=ru_RU.UTF-8;LC_COLLATE=en_US.UTF-8;LC_MONETARY=ru_RU.UTF-8;LC_MESSAGES=en_US.UTF-8;LC_PAPER=ru_RU.UTF-8;LC_NAME=ru_RU.UTF-8;LC_ADDRESS=ru_RU.UTF-8;LC_TELEPHONE=ru_RU.UTF-8;LC_MEASUREMENT=ru_RU.UTF-8;LC_IDENTIFICATION=ru_RU.UTF-8'.
+
+
+Tue Oct 20 01:57:06 2026
+Command line: PhotoRec /log /debug /d /tmp/vanish_photorec/recup_whole /dev/loop0
+
+PhotoRec 7.2, Data Recovery Utility, February 2024
+Christophe GRENIER <grenier@cgsecurity.org>
+https://www.cgsecurity.org
+OS: Linux, kernel 7.2.11-1-cachyos (#1 SMP PREEMPT_DYNAMIC Sun, 18 Oct 2026 14:54:49 +0000) x86_64
+Compiler: GCC 16.2
+ext2fs lib: 1.47.4, ntfs lib: libntfs-3g, ewf lib: none, libjpeg: libjpeg-turbo-3.2.0, curses lib: ncurses 6.6
+Hard disk list
+Disk /dev/loop0 - 268 MB / 256 MiB - 524288 sectors (RO), sector size=512
+
+Can't open photorec.ses file: No such file or directory
+Partition table type (auto): None
+
+recover_EXT2: s_block_group_nr=0/32, s_mnt_count=1/4294967295, s_blocks_per_group=8192, s_inodes_per_group=2048
+recover_EXT2: s_blocksize=1024
+recover_EXT2: s_blocks_count 262144
+recover_EXT2: part_size 524288
+Filesystem created: Tue Oct 20 01:39:12 2026
+Last mount time:    Tue Oct 20 01:39:12 2026
+     Unknown                        0     524287     524288 [Whole disk]
+   P ext4                           0     524287     524288
+     ext4 blocksize=1024 Large_file Sparse_SB, 268 MB / 256 MiB
+ext2/ext3/ext4 mode activated.
+743 first-level signatures enabled
+
+Analyse
+   P ext4                           0     524287     524288
+     ext4 blocksize=1024 Large_file Sparse_SB, 268 MB / 256 MiB
+Pass 0 (blocksize=1024) STATUS_FIND_OFFSET
+blocksize=1024, offset=0
+Elapsed time 0h00m00s
+Pass 1 (blocksize=1024) STATUS_EXT2_ON
+* 0-524287: (null)
+524288 sectors contain unknown data, 0 invalid files found and rejected.
+/tmp/vanish_photorec/recup_whole.1/f0000002.ext	 2-3
+/tmp/vanish_photorec/recup_whole.1/f0015944.ext	 15944-15945
+/tmp/vanish_photorec/recup_whole.1/f0015946.ext	 15946-15947
+/tmp/vanish_photorec/recup_whole.1/f0016386.ext	 16386-16387
+/tmp/vanish_photorec/recup_whole.1/f0049154.ext	 49154-49155
+/tmp/vanish_photorec/recup_whole.1/f0081922.ext	 81922-81923
+/tmp/vanish_photorec/recup_whole.1/f0114690.ext	 114690-114691
+/tmp/vanish_photorec/recup_whole.1/f0147458.ext	 147458-147459
+/tmp/vanish_photorec/recup_whole.1/f0278594.ext	 278594-278595
+/tmp/vanish_photorec/recup_whole.1/f0278596.ext	 278596-278597
+/tmp/vanish_photorec/recup_whole.1/f0409602.ext	 409602-409603
+/tmp/vanish_photorec/recup_whole.1/f0442370.ext	 442370-442371
+Elapsed time 0h00m00s
+Pass 1 +0 file
+Total: 0 files found
+
+0-1: (null)
+4-15943: (null)
+15948-16385: (null)
+16388-49153: (null)
+49156-81921: (null)
+81924-114689: (null)
+114692-147457: (null)
+147460-278593: (null)
+278598-409601: (null)
+409604-442369: (null)
+442372-524287: (null)
+524264 sectors contain unknown data, 0 invalid files found and rejected.
+
+perf: get_prev_file_header: 10, get_prev_location_smart: 0
+PhotoRec exited normally.

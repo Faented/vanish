@@ -1,0 +1,21 @@
+[RUN] 1: wipe файла 1МБ
+targets: ok=1, skipped=0, rejected=0, failed=0; bytes wiped: 1 MB; exit=0
+[OK] 1: wipe rc (rc=0)
+[OK] 1: файл удалён
+[RUN] 2: recovery хвоста
+targets: ok=1, skipped=0, rejected=0, failed=0; bytes wiped: 0 MB; exit=0
+note: найдено хвостов-файлов: 1
+note: убрано пустых хвостов-каталогов: 0
+[OK] 2: recovery rc (rc=0)
+[OK] 2: хвост дожат
+targets: ok=1, skipped=0, rejected=0, failed=0; bytes wiped: 0 MB; exit=0
+[OK] 3: 3-pass verify rc (rc=0)
+targets: ok=4, skipped=0, rejected=0, failed=0; bytes wiped: 0 MB; exit=0
+note: дерево 5cd74fef91d8934f32450ec94839be1cf68ecb7ccd38c1a02713382e9fa3cf13: файлов 2, папок 2
+[OK] 4: дерево rc (rc=0)
+[OK] 4: дерево удалено
+targets: ok=1, skipped=0, rejected=0, failed=0; bytes wiped: 0 MB; exit=0
+[OK] 5: no-rename rc (rc=0)
+targets: ok=1, skipped=0, rejected=0, failed=0; bytes wiped: 1 MB; exit=0
+[OK] 6: маркер-файл rc (rc=0)
+=== SWEEP DONE: fail=0 ===
