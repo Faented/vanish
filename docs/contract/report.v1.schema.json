@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vanish.report.v1",
+  "title": "vanish отчёт прогона v1",
+  "type": "object",
+  "required": ["schema", "started_ms", "finished_ms", "code", "ok", "skipped", "rejected", "failed", "bytes", "targets", "notes"],
+  "properties": {
+    "schema": { "const": "vanish.report.v1" },
+    "started_ms": { "type": "integer", "doc": "unix ms" },
+    "finished_ms": { "type": "integer", "doc": "unix ms" },
+    "code": { "type": "integer", "minimum": 0, "maximum": 4 },
+    "ok": { "type": "integer", "minimum": 0 },
+    "skipped": { "type": "integer", "minimum": 0 },
+    "rejected": { "type": "integer", "minimum": 0 },
+    "failed": { "type": "integer", "minimum": 0 },
+    "bytes": { "type": "integer", "minimum": 0 },
+    "notes": { "type": "array", "items": { "type": "string" } },
+    "targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "name_hash", "status", "bytes", "warnings", "elapsed_ms"],
+        "properties": {
+          "kind": { "enum": ["file", "dir", "tail", "stream"] },
+          "name_hash": {
+            "type": "string",
+            "doc": "SHA-256 hex от исходного пути; plaintext имён ЗАПРЕЩЁН (инвариант 7)"
+          },
+          "tail": { "type": ["string", "null"], "doc": "имя-хвост .vanish-v1-…" },
+          "strategy": {
+            "type": ["string", "null"],
+            "enum": ["hdd_overwrite", "overwrite_dealloc", "ram_unlink", "cow_accept", null]
+          },
+          "status": { "enum": ["ok", "skipped", "rejected", "failed"] },
+          "reason": { "type": ["string", "null"] },
+          "bytes": { "type": "integer", "minimum": 0, "doc": "фактически перезаписанные; 0 если стратегия не пишет (ram_unlink/cow_accept)" },
+          "warnings": { "type": "array", "items": { "type": "string" } },
+          "guarantees": {
+            "type": ["object", "null"],
+            "properties": {
+              "ssd_chipoff_protected": { "type": "boolean" },
+              "journal_contains_old_names": { "type": "boolean" },
+              "swap_pages_possible": { "type": "boolean" },
+              "encrypted_at_rest": { "type": "boolean" }
+            }
+          },
+          "elapsed_ms": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

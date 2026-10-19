@@ -1,0 +1,20 @@
+[package]
+name = "vanish"
+description = "vanish: secure, honest file/directory deletion (CLI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vanish"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+vanish-core = { workspace = true }
+backend-linux = { workspace = true }
+backend-windows = { workspace = true }
+backend-macos = { workspace = true }

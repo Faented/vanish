@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vanish-core",
+    "crates/vanish-cli",
+    "crates/backend-linux",
+    "crates/backend-windows",
+    "crates/backend-macos",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "GPL-3.0-or-later"
+repository = "https://example.invalid/vanish"
+
+[workspace.dependencies]
+libc = "0.2"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+rand_chacha = "0.3"
+zeroize = "1"
+vanish-core = { path = "crates/vanish-core" }
+backend-linux = { path = "crates/backend-linux" }
+backend-windows = { path = "crates/backend-windows" }
+backend-macos = { path = "crates/backend-macos" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.rand_chacha]
+opt-level = 3

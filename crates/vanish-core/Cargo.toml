@@ -1,0 +1,22 @@
+[package]
+name = "vanish-core"
+description = "vanish: platform-agnostic secure deletion pipeline (contract, decision, report)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+zeroize = { workspace = true }
+libc = { workspace = true }
+
+[lib]
+name = "vanish_core"
+path = "src/lib.rs"

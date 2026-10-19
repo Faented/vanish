@@ -1,0 +1,15 @@
+[package]
+name = "backend-macos"
+description = "vanish: macOS backend (planned phase M6)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vanish-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lib]
+name = "backend_macos"
+path = "src/lib.rs"

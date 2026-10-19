@@ -1,0 +1,15 @@
+[package]
+name = "backend-windows"
+description = "vanish: Windows backend (planned phase M4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vanish-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lib]
+name = "backend_windows"
+path = "src/lib.rs"

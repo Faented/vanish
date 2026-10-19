@@ -1,0 +1,7 @@
+/target
+Cargo.lock.bak
+*.tmp
+*.img
+*.raw
+docs/qa/_corpus
+tests/_scratch
