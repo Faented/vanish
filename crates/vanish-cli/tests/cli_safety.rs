@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,14 +8,35 @@ fn fixture() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let base = if std::path::Path::new("/tmp/opencode").is_dir() {
+    let base = if Path::new("/tmp/opencode").is_dir() {
         PathBuf::from("/tmp/opencode")
     } else {
+        // The CLI safety tests must not depend on the host root filesystem or
+        // swap placement. A tmpfs is a supported pipeline and keeps the tests
+        // deterministic on CI runners; fall back only if it is unavailable.
+        #[cfg(target_os = "linux")]
+        if Path::new("/dev/shm").is_dir() {
+            return create_fixture(Path::new("/dev/shm"), stamp);
+        }
         std::env::temp_dir()
     };
+    create_fixture(&base, stamp)
+}
+
+fn create_fixture(base: &Path, stamp: u128) -> PathBuf {
     let path = base.join(format!("vanish-cli-test-{}-{}", std::process::id(), stamp));
     fs::create_dir(&path).expect("fixture directory");
     path
+}
+
+fn assert_exit(output: &std::process::Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "unexpected exit status\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -40,7 +61,7 @@ fn dry_run_preserves_target_and_honors_json_and_report() {
         target.to_str().unwrap(),
     ]);
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_exit(&output, 0);
     assert!(target.exists());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("vanish.report.v1"));
@@ -64,7 +85,7 @@ fn missing_and_symlink_are_rejected_without_following_link() {
 
     let output = run(&["--json", missing.to_str().unwrap(), link.to_str().unwrap()]);
 
-    assert_eq!(output.status.code(), Some(3));
+    assert_exit(&output, 3);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("missing target"));
     assert!(stdout.contains("symlink target"));
@@ -79,7 +100,7 @@ fn device_dry_run_is_disabled_without_touching_supplied_path() {
     let supplied = root.join("not-a-device");
     let output = run(&["device", "--dry-run", "--json", supplied.to_str().unwrap()]);
 
-    assert_eq!(output.status.code(), Some(3));
+    assert_exit(&output, 3);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("device execution disabled"));
     assert!(!supplied.exists());
@@ -99,7 +120,7 @@ fn freespace_dry_run_does_not_create_a_scratch_file() {
         root.to_str().unwrap(),
     ]);
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_exit(&output, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("no file created or written"));
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
@@ -119,7 +140,7 @@ fn report_cannot_overwrite_target_or_existing_file() {
             destination.to_str().unwrap(),
             target.to_str().unwrap(),
         ]);
-        assert_eq!(output.status.code(), Some(4));
+        assert_exit(&output, 4);
         assert_eq!(fs::read(&target).unwrap(), b"keep target");
         assert_eq!(fs::read(&report).unwrap(), b"keep report");
     }
@@ -140,7 +161,7 @@ fn report_inside_target_tree_is_rejected_even_in_dry_run() {
         report.to_str().unwrap(),
         tree.to_str().unwrap(),
     ]);
-    assert_eq!(output.status.code(), Some(4));
+    assert_exit(&output, 4);
     assert!(!report.exists());
     assert_eq!(fs::read(&target).unwrap(), b"keep");
     fs::remove_dir_all(root).unwrap();
@@ -164,7 +185,7 @@ fn report_symlink_and_symlink_parent_are_rejected() {
             destination.to_str().unwrap(),
             target.to_str().unwrap(),
         ]);
-        assert_eq!(output.status.code(), Some(4));
+        assert_exit(&output, 4);
         assert_eq!(fs::read(&target).unwrap(), b"keep");
     }
     assert_eq!(fs::read_dir(parent).unwrap().count(), 0);
@@ -186,7 +207,7 @@ fn report_is_private_and_matches_stdout() {
         report.to_str().unwrap(),
         target.to_str().unwrap(),
     ]);
-    assert_eq!(output.status.code(), Some(0));
+    assert_exit(&output, 0);
     assert_eq!(fs::read(&report).unwrap(), output.stdout);
     assert_eq!(
         fs::metadata(report).unwrap().permissions().mode() & 0o077,
@@ -201,7 +222,7 @@ fn device_execution_is_disabled_and_preserves_regular_file() {
     let supplied = root.join("owned-file");
     fs::write(&supplied, b"keep").unwrap();
     let output = run(&["device", supplied.to_str().unwrap(), "--json"]);
-    assert_eq!(output.status.code(), Some(3));
+    assert_exit(&output, 3);
     assert!(String::from_utf8_lossy(&output.stdout).contains("device execution disabled"));
     assert_eq!(fs::read(&supplied).unwrap(), b"keep");
     fs::remove_dir_all(root).unwrap();
@@ -213,7 +234,7 @@ fn overlapping_targets_are_rejected_before_deletion() {
     let target = root.join("keep");
     fs::write(&target, b"keep").unwrap();
     let output = run(&["--json", root.to_str().unwrap(), target.to_str().unwrap()]);
-    assert_eq!(output.status.code(), Some(3));
+    assert_exit(&output, 3);
     assert_eq!(fs::read(&target).unwrap(), b"keep");
     assert!(!String::from_utf8_lossy(&output.stdout).contains(root.to_str().unwrap()));
     fs::remove_dir_all(root).unwrap();
@@ -261,7 +282,7 @@ fn freespace_checks_policy_before_creating_scratch_file() {
         "--disable-swap-for-wipe",
         "--json",
     ]);
-    assert_eq!(output.status.code(), Some(3));
+    assert_exit(&output, 3);
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     fs::remove_dir_all(root).unwrap();
 }
@@ -277,7 +298,7 @@ fn symlink_dotdot_path_is_rejected_without_touching_either_file() {
     std::os::unix::fs::symlink(destination.join("inner"), root.join("link")).unwrap();
     let input = root.join("link/../keep");
     let output = run(&["--json", input.to_str().unwrap()]);
-    assert_eq!(output.status.code(), Some(3));
+    assert_exit(&output, 3);
     assert_eq!(fs::read(root.join("keep")).unwrap(), b"lexical");
     assert_eq!(fs::read(destination.join("keep")).unwrap(), b"resolved");
     fs::remove_dir_all(root).unwrap();
@@ -289,7 +310,7 @@ fn subcommand_name_after_target_is_rejected_not_treated_as_target() {
     let target = root.join("check");
     fs::write(&target, b"keep").unwrap();
     let output = run(&["--dry-run", target.to_str().unwrap(), "check"]);
-    assert_eq!(output.status.code(), Some(2));
+    assert_exit(&output, 2);
     assert_eq!(fs::read(&target).unwrap(), b"keep");
     fs::remove_dir_all(root).unwrap();
 }
