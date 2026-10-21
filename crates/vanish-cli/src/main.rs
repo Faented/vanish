@@ -276,6 +276,12 @@ fn safety_refuse(path: &Path, o: &Options) -> Option<&'static str> {
     // kernel interfaces.
     for bad in ["/proc", "/sys", "/dev", "/run"] {
         if s == bad || s.starts_with(&format!("{bad}/")) {
+            // /dev/shm is a user-data tmpfs, not the device namespace. It is a
+            // supported pipeline target; /dev itself and real device nodes stay
+            // protected. The canonical path has no symlink components here.
+            if bad == "/dev" && (s == "/dev/shm" || s.starts_with("/dev/shm/")) {
+                continue;
+            }
             return Some("protected filesystem");
         }
     }
@@ -1066,6 +1072,21 @@ mod tests {
         assert!(opts.force_fs);
         assert_eq!(
             safety_refuse(Path::new("/proc"), &opts),
+            Some("protected filesystem")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dev_shm_is_user_data_not_device_namespace() {
+        if !Path::new("/dev/shm").is_dir() {
+            return;
+        }
+        let cli = Cli::try_parse_from(["vanish", "/dev/shm"]).expect("arguments parse");
+        let opts = cli.opts().expect("valid options");
+        assert_eq!(safety_refuse(Path::new("/dev/shm"), &opts), None);
+        assert_eq!(
+            safety_refuse(Path::new("/dev/null"), &opts),
             Some("protected filesystem")
         );
     }
