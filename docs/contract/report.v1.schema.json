@@ -21,19 +21,19 @@
         "type": "object",
         "required": ["kind", "name_hash", "status", "bytes", "warnings", "elapsed_ms"],
         "properties": {
-          "kind": { "enum": ["file", "dir", "tail", "stream"] },
+          "kind": { "enum": ["file", "dir", "tail", "stream", "freespace", "device"] },
           "name_hash": {
             "type": "string",
-            "doc": "SHA-256 hex от исходного пути; plaintext имён ЗАПРЕЩЁН (инвариант 7)"
+            "doc": "SHA-256 hex от исходного пути; plaintext имён ЗАПРЕЩЁН (инвариант 7). Без соли: отчёт чувствителен к перебору известных путей"
           },
           "tail": { "type": ["string", "null"], "doc": "имя-хвост .vanish-v1-…" },
           "strategy": {
             "type": ["string", "null"],
-            "enum": ["hdd_overwrite", "overwrite_dealloc", "ram_unlink", "cow_accept", null]
+            "enum": ["hdd_overwrite", "overwrite_dealloc", "ram_unlink", "cow_accept", "planned", "disabled", null]
           },
           "status": { "enum": ["ok", "skipped", "rejected", "failed"] },
           "reason": { "type": ["string", "null"] },
-          "bytes": { "type": "integer", "minimum": 0, "doc": "фактически перезаписанные; 0 если стратегия не пишет (ram_unlink/cow_accept)" },
+          "bytes": { "type": "integer", "minimum": 0, "doc": "сумма длин фактически перезаписанных extents; 0 для плана, ram_unlink/cow_accept и не начатых целей" },
           "warnings": { "type": "array", "items": { "type": "string" } },
           "guarantees": {
             "type": ["object", "null"],

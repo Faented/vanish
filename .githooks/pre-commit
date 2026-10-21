@@ -17,46 +17,70 @@ EXCLUDE=(
 is_excluded() {
   local f="$1"
   for e in "${EXCLUDE[@]}"; do
-    case "$f" in "$e"*) return 0 ;; esac
+    if [[ "$e" == */ ]]; then
+      case "$f" in "$e"*) return 0 ;; esac
+    elif [[ "$f" == "$e" ]]; then
+      return 0
+    fi
   done
   return 1
 }
 
 SECRET_RE='(-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|ghu_[A-Za-z0-9]{36}|ghs_[A-Za-z0-9]{36}|ghr_[A-Za-z0-9]{36}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|sk-[A-Za-z0-9]{32,})'
 
-files="$(git diff --cached --name-only --diff-filter=ACM || true)"
-[ -z "$files" ] && exit 0
+cd "$(git rev-parse --show-toplevel)"
+tmp_base=${TMPDIR:-/tmp}
+if [ -d /tmp/opencode ]; then tmp_base=/tmp/opencode; fi
+scratch=$(mktemp -d "$tmp_base/vanish-precommit.XXXXXXXX")
+trap 'rm -f -- "$scratch/paths" "$scratch/blob"; rmdir -- "$scratch"' EXIT
+git diff --cached --name-only --diff-filter=ACMRT -z > "$scratch/paths"
 
 rc=0
-while IFS= read -r f; do
-  [ -f "$f" ] || continue
+while IFS= read -r -d '' f; do
   is_excluded "$f" && continue
+  # 0) крупный кадр — до чтения blob в память/скретч
+  size=$(git cat-file -s ":$f")
+  if [ "$size" -gt 5242880 ]; then
+    echo "[pre-commit] ЗАПРЕТ: '$f' = $size байт (> 5 МиБ). Бинарники/дампы в git не нужны; при осознанной необходимости — git commit --no-verify" >&2
+    rc=1
+    continue
+  fi
+  # Inspect the indexed blob, not the working copy (partial staging matters).
+  git show ":$f" > "$scratch/blob"
 
   # 1) секретоподобные строки — жёсткий запрет
-  if grep -qE "$SECRET_RE" "$f"; then
-    echo "[pre-commit] ЗАПРЕТ: похоже на секрет (ключ/токен) в '$f':" >&2
-    grep -nE "$SECRET_RE" "$f" | head -3 | sed 's/^/[pre-commit]   /' >&2
+  scan_rc=0
+  grep -qE "$SECRET_RE" "$scratch/blob" || scan_rc=$?
+  if [ "$scan_rc" = 0 ]; then
+    echo "[pre-commit] ЗАПРЕТ: похоже на секрет (ключ/токен) в '$f' (значение скрыто)" >&2
+    rc=1
+  elif [ "$scan_rc" -gt 1 ]; then
+    echo "[pre-commit] ЗАПРЕТ: ошибка проверки индексированного файла" >&2
     rc=1
   fi
 
   # 2) забывчивые .env / ключевые файлы
-  case "$f" in
+  case "${f##*/}" in
     .env|.env.*|*.pem|*.key|*.pfx|*.p12|id_rsa*|id_ed25519*|id_ecdsa*|id_dsa*)
       echo "[pre-commit] ЗАПРЕТ: файл '$f' относится к классу секретов (добавить можно только осознанно: git commit --no-verify)" >&2
       rc=1 ;;
   esac
 
-  # 3) крупный кадр
-  size=$(stat -c %s "$f" 2>/dev/null || echo 0)
-  if [ "$size" -gt 5242880 ]; then
-    echo "[pre-commit] ЗАПРЕТ: '$f' = $size байт (> 5 МиБ). Бинарники/дампы в git не нужны; при осознанной необходимости — git commit --no-verify" >&2
+  # 4) tracked-but-ignored: forced additions must not silently bypass policy.
+  ignore_rc=0
+  git check-ignore --no-index -q -- "$f" || ignore_rc=$?
+  if [ "$ignore_rc" = 0 ]; then
+    echo "[pre-commit] ЗАПРЕТ: '$f' соответствует .gitignore" >&2
+    rc=1
+  elif [ "$ignore_rc" -gt 1 ]; then
+    echo "[pre-commit] ЗАПРЕТ: не удалось проверить .gitignore" >&2
     rc=1
   fi
 
-  # 4) generic-подозрения (только предупреждение)
-  if grep -qE "([Pp]assword|[Ss]ecret|[Tt]oken)[[:space:]]*[:=][[:space:]]*[\"'][^\"']{8,}[\"']" "$f"; then
+  # 5) generic-подозрения (только предупреждение)
+  if grep -qE "([Pp]assword|[Ss]ecret|[Tt]oken)[[:space:]]*[:=][[:space:]]*[\"'][^\"']{8,}[\"']" "$scratch/blob"; then
     echo "[pre-commit] ВНИМАНИЕ: в '$f' похоже на хардкод пароля/токена — убедитесь, что это безвредная фикстура" >&2
   fi
-done <<< "$files"
+done < "$scratch/paths"
 
 exit $rc

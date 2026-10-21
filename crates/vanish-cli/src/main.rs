@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -28,7 +28,8 @@ use backend_windows as be;
 #[command(
     name = "vanish",
     version,
-    about = "vanish — честное защищённое удаление (файлы/папки). Отказ лучше иллюзии защищённости."
+    about = "vanish — честное защищённое удаление (файлы/папки). Отказ лучше иллюзии защищённости.",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
     /// цели (файлы или папки)
@@ -72,8 +73,6 @@ struct Cli {
     disable_swap_for_wipe: bool,
     #[arg(long, global = true)]
     xdev: bool,
-    #[arg(long, global = true)]
-    yes: bool,
     #[arg(long, global = true)]
     recovery_scan: bool,
     /// freespace limit in bytes (default: 95% of available space)
@@ -121,12 +120,17 @@ impl Cli {
             }
             Some(other) => return Err(format!("неизвестный pattern: {}", other)),
         };
-        let mut passes = self.passes;
+        let passes = self.passes;
         if passes == 0 {
             return Err("--passes должен быть >= 1".into());
         }
         if matches!(pattern, PatternChoice::Hex(_)) && passes > 16 {
-            passes = 16;
+            // A one-byte pattern has only 16 distinct values per pass; silently
+            // capping would pretend more passes ran than the report shows.
+            return Err("--pattern hex:XX: --passes не может быть больше 16".into());
+        }
+        if self.size.is_some() && !matches!(self.cmd, Some(Cmd::Freespace { .. })) {
+            return Err("--size допустим только с подкомандой freespace".into());
         }
         Ok(Options {
             passes,
@@ -145,7 +149,6 @@ impl Cli {
             xdev: self.xdev,
             json: self.json,
             report_file: self.report.clone(),
-            yes: self.yes,
         })
     }
 }
@@ -179,9 +182,18 @@ fn absolute_normalized(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn has_symlink_component(path: &Path) -> io::Result<bool> {
-    let absolute = absolute_normalized(path)?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     let mut current = PathBuf::new();
     for component in absolute.components() {
+        // Do not lexically erase `link/..`: kernel resolution may reach a
+        // different directory. The backend rejects parent traversal as well.
+        if component == std::path::Component::ParentDir {
+            return Ok(true);
+        }
         current.push(component.as_os_str());
         if let Ok(md) = std::fs::symlink_metadata(&current) {
             if md.file_type().is_symlink() {
@@ -234,14 +246,13 @@ fn prepare_report(
         }
     }
 
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut open = OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    open.mode(0o600);
+    let file = open
         .open(&absolute)
         .map_err(|_| "cannot create report file")?;
-    #[cfg(unix)]
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|_| "cannot secure report file")?;
     Ok(Some(ReportSink { file }))
 }
 
@@ -260,11 +271,12 @@ fn safety_refuse(path: &Path, o: &Options) -> Option<&'static str> {
     if s == "/" && !o.no_preserve_root {
         return Some("preserve_root");
     }
-    if !o.force_fs {
-        for bad in ["/proc", "/sys", "/dev", "/run"] {
-            if s == bad || s.starts_with(&format!("{bad}/")) {
-                return Some("protected filesystem");
-            }
+    // System pseudo-filesystems are always refused. --force-fs is an explicit
+    // override for an unsupported ordinary filesystem, not a permit to wipe
+    // kernel interfaces.
+    for bad in ["/proc", "/sys", "/dev", "/run"] {
+        if s == bad || s.starts_with(&format!("{bad}/")) {
+            return Some("protected filesystem");
         }
     }
     None
@@ -284,7 +296,7 @@ fn make_platform() -> Box<dyn Platform> {
     be::platform()
 }
 
-fn compute_exit(report: &RunReport) -> u8 {
+fn compute_exit(report: &RunReport, dry_run: bool) -> u8 {
     let interrupted = report.targets.iter().any(|event| {
         event.status == "skipped"
             && event
@@ -293,27 +305,30 @@ fn compute_exit(report: &RunReport) -> u8 {
                 .is_some_and(|reason| reason.contains("SIGINT") || reason.contains("SIGTERM"))
     });
     if report.failed > 0 {
-        4
-    } else if report.rejected > 0 && report.ok == 0 && !interrupted {
-        3
-    } else if report.ok > 0 && report.rejected == 0 && !interrupted {
-        0
-    } else if report.rejected == 0 && !interrupted {
-        // A dry-run is intentionally represented by skipped events. Planning
-        // without touching anything is a successful operation, not partial.
-        0
-    } else if report.targets.is_empty() && !interrupted {
-        0
-    } else {
-        1
+        return 4;
     }
+    if interrupted {
+        return 1;
+    }
+    if report.rejected > 0 {
+        return if report.ok == 0 { 3 } else { 1 };
+    }
+    // Outside a dry-run a skipped target means the requested work was not done
+    // (for example a directory that could not be emptied). That is a partial
+    // result, never success. A dry-run is intentionally all-skipped.
+    if !dry_run && report.skipped > 0 {
+        return 1;
+    }
+    0
 }
 
-fn emit(report: &RunReport, cli: &Cli, mut sink: Option<ReportSink>) -> bool {
+fn emit(report: &mut RunReport, cli: &Cli, mut sink: Option<ReportSink>) -> bool {
     let mut success = true;
     if cli.json {
         let mut out = io::stdout().lock();
-        if serde_json::to_writer_pretty(&mut out, report).is_err() || out.write_all(b"\n").is_err()
+        if serde_json::to_writer_pretty(&mut out, report).is_err()
+            || out.write_all(b"\n").is_err()
+            || out.flush().is_err()
         {
             success = false;
         }
@@ -334,6 +349,16 @@ fn emit(report: &RunReport, cli: &Cli, mut sink: Option<ReportSink>) -> bool {
                 success = false;
                 break;
             }
+            for warning in &target.warnings {
+                eprintln!(
+                    "  warning[{}]: {}",
+                    target.name_hash.get(0..12).unwrap_or("?"),
+                    warning
+                );
+            }
+        }
+        if out.flush().is_err() {
+            success = false;
         }
         eprintln!("{}", report.summary_text());
         for note in &report.notes {
@@ -341,6 +366,11 @@ fn emit(report: &RunReport, cli: &Cli, mut sink: Option<ReportSink>) -> bool {
         }
     }
     if let Some(ref mut sink) = sink {
+        // The report file must agree with the process exit contract even when
+        // stdout (or the JSON stream) failed after the report was finished.
+        if !success {
+            report.code = 4;
+        }
         if write_serialized(sink, report).is_err() {
             eprintln!("report output failed");
             success = false;
@@ -350,8 +380,8 @@ fn emit(report: &RunReport, cli: &Cli, mut sink: Option<ReportSink>) -> bool {
 }
 
 fn finish_run(report: RunReport, code: u8, cli: &Cli, sink: Option<ReportSink>) -> u8 {
-    let finished = report.finish(code);
-    if emit(&finished, cli, sink) {
+    let mut finished = report.finish(code);
+    if emit(&mut finished, cli, sink) {
         code
     } else {
         4
@@ -374,7 +404,7 @@ fn record_rejection(report: &mut RunReport, kind: &str, path: &Path, detail: &'s
 }
 
 fn wipe_mode(cli: &Cli, opts: &Options, plat: Option<Box<dyn Platform>>) -> u8 {
-    let sink = match prepare_report(cli.report.as_deref(), &cli.targets, !opts.dry_run) {
+    let sink = match prepare_report(cli.report.as_deref(), &cli.targets, true) {
         Ok(sink) => sink,
         Err(_) => {
             eprintln!("report setup failed");
@@ -492,19 +522,17 @@ fn wipe_mode(cli: &Cli, opts: &Options, plat: Option<Box<dyn Platform>>) -> u8 {
     }
 
     for candidate in candidates.into_iter().flatten() {
-        if vanish_core::signal::shutdown_requested() {
-            let mut pipe = vanish_core::pipeline::Pipeline::new(plat.as_ref(), opts, &mut report);
-            pipe.wipe_any(&candidate.path);
-            continue;
-        }
+        // Canonical paths are absolute and free of symlink components; the core
+        // rejects relative targets before any rename. SIGINT is handled inside
+        // wipe_any: it emits a skipped event and starts no further work.
         let mut pipe = vanish_core::pipeline::Pipeline::new(plat.as_ref(), opts, &mut report);
-        pipe.wipe_any(&candidate.path);
+        pipe.wipe_any(&candidate.canonical);
     }
-    let code = compute_exit(&report);
+    let code = compute_exit(&report, opts.dry_run);
     finish_run(report, code, cli, sink)
 }
 
-fn check_mode(paths: &[PathBuf], cli: &Cli) -> u8 {
+fn check_mode(paths: &[PathBuf], cli: &Cli, opts: &Options) -> u8 {
     let sink = match prepare_report(cli.report.as_deref(), paths, false) {
         Ok(sink) => sink,
         Err(_) => {
@@ -513,7 +541,7 @@ fn check_mode(paths: &[PathBuf], cli: &Cli) -> u8 {
         }
     };
     let plat = make_platform();
-    let rep = match vanish_core::check::run(plat.as_ref(), paths) {
+    let rep = match vanish_core::check::run(plat.as_ref(), paths, opts) {
         Ok(report) => report,
         Err(_) => {
             eprintln!("check failed");
@@ -523,8 +551,9 @@ fn check_mode(paths: &[PathBuf], cli: &Cli) -> u8 {
     let mut success = true;
     if cli.json {
         let mut out = io::stdout().lock();
-        success =
-            serde_json::to_writer_pretty(&mut out, &rep).is_ok() && out.write_all(b"\n").is_ok();
+        success = serde_json::to_writer_pretty(&mut out, &rep).is_ok()
+            && out.write_all(b"\n").is_ok()
+            && out.flush().is_ok();
     } else {
         eprintln!("backend: {}", rep.backend);
         for entry in &rep.entries {
@@ -564,15 +593,35 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
         }
     };
     let mut report = RunReport::new();
+    // Check the same filesystem policy before filling space, not only when the
+    // resulting scratch file reaches the wipe pipeline.
+    let platform = make_platform();
+    let preflight = (|| -> vanish_core::error::Result<()> {
+        let md = std::fs::symlink_metadata(&dir)?;
+        if !md.is_dir() || has_symlink_component(&dir)? || safety_refuse(&dir, opts).is_some() {
+            return Err(VanishError::UnsafePath("unsafe freespace directory".into()));
+        }
+        let volume = platform.fsinfo(&dir)?;
+        vanish_core::strategy::decide(true, &volume, opts)?;
+        Ok(())
+    })();
+    if let Err(error) = preflight {
+        let mut pipe = vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+        pipe.record_error("freespace", &dir, &error);
+        let code = compute_exit(&report, opts.dry_run);
+        return finish_run(report, code, cli, sink);
+    }
+    // The preflight above already rejected symlink components; the canonical
+    // absolute path keeps the scratch file and the core pipeline consistent.
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let avail = match be::avail_bytes(&dir) {
         Ok(available) => available,
         Err(error) => {
-            let error: VanishError = error.into();
             let platform = make_platform();
             let mut pipe =
                 vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
             pipe.record_error("freespace", &dir, &error);
-            let code = compute_exit(&report);
+            let code = compute_exit(&report, opts.dry_run);
             return finish_run(report, code, cli, sink);
         }
     };
@@ -607,7 +656,7 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
             let mut pipe =
                 vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
             pipe.record_error("freespace", &dir, &error);
-            let code = compute_exit(&report);
+            let code = compute_exit(&report, opts.dry_run);
             return finish_run(report, code, cli, sink);
         }
     };
@@ -618,7 +667,10 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
     {
         let mut writer = io::BufWriter::with_capacity(1024 * 1024, file.take().unwrap());
         while written < budget {
-            let amount = std::cmp::min((budget - written) as usize, zero.len());
+            if vanish_core::signal::shutdown_requested() {
+                break;
+            }
+            let amount = std::cmp::min(budget - written, zero.len() as u64) as usize;
             if let Err(error) = writer.write_all(&zero[..amount]) {
                 write_error = Some(error);
                 break;
@@ -647,6 +699,35 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
         }
     }
 
+    if write_error.is_none() && vanish_core::signal::shutdown_requested() {
+        // The scratch file exists only to occupy free space. On SIGINT/SIGTERM
+        // remove it directly instead of starting another (potentially long) wipe.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.push(TargetEvent {
+                    kind: "freespace".into(),
+                    name_hash: vanish_core::util::name_sha256(&path),
+                    tail: None,
+                    strategy: Some("planned".into()),
+                    status: "skipped".into(),
+                    reason: Some("SIGINT/SIGTERM: freespace остановлен, скретч-файл удалён".into()),
+                    bytes: 0,
+                    warnings: vec![],
+                    guarantees: None,
+                    elapsed_ms: 0,
+                });
+            }
+            Err(error) => {
+                let platform = make_platform();
+                let mut pipe =
+                    vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+                pipe.record_error("freespace", &path, &VanishError::Io(error));
+            }
+        }
+        let code = compute_exit(&report, opts.dry_run);
+        return finish_run(report, code, cli, sink);
+    }
+
     if let Some(error) = write_error {
         if let Ok(md) = std::fs::symlink_metadata(&path) {
             let target = Target::from_parts(
@@ -661,6 +742,11 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
                 vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
             if let Err(cleanup) = pipe.wipe_target(target, false) {
                 pipe.record_error("file", &path, &cleanup);
+                // This is our own zero-filled scratch file; never leave it
+                // behind, even when the wipe pipeline refused the target.
+                if let Err(remove) = std::fs::remove_file(&path) {
+                    pipe.record_error("file", &path, &VanishError::Io(remove));
+                }
             }
         }
         let error = VanishError::Io(error);
@@ -682,6 +768,9 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
                     vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
                 if let Err(error) = pipe.wipe_target(target, false) {
                     pipe.record_error("file", &path, &error);
+                    if let Err(remove) = std::fs::remove_file(&path) {
+                        pipe.record_error("file", &path, &VanishError::Io(remove));
+                    }
                 }
             }
             Err(error) => {
@@ -693,7 +782,7 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
             }
         }
     }
-    let code = compute_exit(&report);
+    let code = compute_exit(&report, opts.dry_run);
     finish_run(report, code, cli, sink)
 }
 
@@ -757,7 +846,7 @@ fn recovery_mode(roots: Vec<PathBuf>, cli: &Cli, opts: &Options) -> u8 {
     } else {
         roots
     };
-    let sink = match prepare_report(cli.report.as_deref(), &roots, !opts.dry_run) {
+    let sink = match prepare_report(cli.report.as_deref(), &roots, true) {
         Ok(sink) => sink,
         Err(_) => {
             eprintln!("report setup failed");
@@ -769,7 +858,9 @@ fn recovery_mode(roots: Vec<PathBuf>, cli: &Cli, opts: &Options) -> u8 {
     let mut valid_roots = Vec::new();
     for root in roots {
         match std::fs::symlink_metadata(&root) {
-            Ok(md) if md.file_type().is_symlink() => {
+            Ok(md)
+                if md.file_type().is_symlink() || has_symlink_component(&root).unwrap_or(true) =>
+            {
                 let error = VanishError::UnsafePath("symlink root".into());
                 let mut pipe =
                     vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
@@ -784,6 +875,18 @@ fn recovery_mode(roots: Vec<PathBuf>, cli: &Cli, opts: &Options) -> u8 {
             Ok(_) | Err(_) => valid_roots.push(root),
         }
     }
+    let valid_roots: Vec<PathBuf> = valid_roots
+        .into_iter()
+        .filter_map(|root| match std::fs::canonicalize(&root) {
+            Ok(canonical) => Some(canonical),
+            Err(error) => {
+                let mut pipe =
+                    vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+                pipe.record_error("tail", &root, &error.into());
+                None
+            }
+        })
+        .collect();
     if !valid_roots.is_empty() {
         if vanish_core::recovery::run(platform.as_ref(), &valid_roots, opts, &mut report).is_err() {
             report.note("recovery file scan failed");
@@ -794,7 +897,7 @@ fn recovery_mode(roots: Vec<PathBuf>, cli: &Cli, opts: &Options) -> u8 {
             report.note("recovery directory scan failed");
         }
     }
-    let code = compute_exit(&report);
+    let code = compute_exit(&report, opts.dry_run);
     finish_run(report, code, cli, sink)
 }
 
@@ -839,6 +942,26 @@ fn main() -> ExitCode {
     if cli.selfcheck.is_some() {
         return ExitCode::from(selfcheck_mode(cli.selfcheck.as_deref()));
     }
+    // clap only recognises a subcommand in the first non-option position; a bare
+    // name like `check` after a target would silently become another positional
+    // target. Refuse instead of guessing. `./check` addresses such a file.
+    if cli.cmd.is_none() {
+        const SUBCOMMANDS: [&str; 4] = ["check", "freespace", "device", "recovery"];
+        if let Some(name) = cli.targets.iter().find_map(|target| {
+            let mut components = target.components();
+            match (components.next(), components.next()) {
+                (Some(std::path::Component::Normal(name)), None) => name.to_str(),
+                _ => None,
+            }
+        }) {
+            if SUBCOMMANDS.contains(&name) {
+                eprintln!(
+                    "usage: '{name}' is a subcommand name; use './{name}' to address a file with this name"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
     let opts = match cli.opts() {
         Ok(opts) => opts,
         Err(error) => {
@@ -847,7 +970,7 @@ fn main() -> ExitCode {
         }
     };
     let code = match &cli.cmd {
-        Some(Cmd::Check { paths }) => check_mode(paths, &cli),
+        Some(Cmd::Check { paths }) => check_mode(paths, &cli, &opts),
         Some(Cmd::Freespace { dir }) => freespace_mode(dir.clone(), &cli, &opts),
         Some(Cmd::Device { dev }) => device_mode(dev.clone(), &cli),
         Some(Cmd::Recovery { roots }) => recovery_mode(roots.clone(), &cli, &opts),
@@ -859,4 +982,91 @@ fn main() -> ExitCode {
         None => wipe_mode(&cli, &opts, None),
     };
     ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(statuses: &[(&str, Option<&str>)]) -> RunReport {
+        let mut report = RunReport::new();
+        for (status, reason) in statuses {
+            report.push(TargetEvent {
+                kind: "file".into(),
+                name_hash: "test".into(),
+                tail: None,
+                strategy: None,
+                status: (*status).into(),
+                reason: reason.map(str::to_string),
+                bytes: 0,
+                warnings: Vec::new(),
+                guarantees: None,
+                elapsed_ms: 0,
+            });
+        }
+        report
+    }
+
+    #[test]
+    fn exit_contract_distinguishes_failed_partial_and_dry_run() {
+        assert_eq!(compute_exit(&report(&[]), false), 0);
+        assert_eq!(compute_exit(&report(&[("ok", None)]), false), 0);
+        assert_eq!(compute_exit(&report(&[("rejected", None)]), false), 3);
+        assert_eq!(
+            compute_exit(&report(&[("ok", None), ("rejected", None)]), false),
+            1
+        );
+        assert_eq!(compute_exit(&report(&[("skipped", None)]), false), 1);
+        assert_eq!(compute_exit(&report(&[("skipped", None)]), true), 0);
+        assert_eq!(
+            compute_exit(
+                &report(&[("skipped", Some("SIGINT/SIGTERM: цель не начата"))]),
+                false
+            ),
+            1
+        );
+        assert_eq!(compute_exit(&report(&[("failed", None)]), false), 4);
+        assert_eq!(
+            compute_exit(&report(&[("failed", None), ("ok", None)]), false),
+            4
+        );
+    }
+
+    #[test]
+    fn hex_pattern_rejects_more_than_sixteen_passes() {
+        let cli = Cli::try_parse_from([
+            "vanish",
+            "--pattern",
+            "hex:aa",
+            "--passes",
+            "17",
+            "/tmp/opencode/target",
+        ])
+        .expect("arguments parse");
+        let error = cli.opts().expect_err("17 hex passes must be rejected");
+        assert!(error.contains("16"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn size_flag_is_only_valid_for_freespace() {
+        let cli = Cli::try_parse_from(["vanish", "--size", "42", "/tmp/opencode/target"])
+            .expect("arguments parse");
+        let error = cli.opts().expect_err("--size outside freespace");
+        assert!(error.contains("freespace"), "unexpected error: {error}");
+
+        let cli = Cli::try_parse_from(["vanish", "freespace", "/tmp/opencode", "--size", "42"])
+            .expect("arguments parse");
+        assert_eq!(cli.opts().expect("freespace accepts --size").passes, 1);
+    }
+
+    #[test]
+    fn force_fs_does_not_override_system_path_protection() {
+        let cli = Cli::try_parse_from(["vanish", "--force-fs", "/proc"]).expect("arguments parse");
+        let opts = cli.opts().expect("valid options");
+        assert!(opts.force_fs);
+        assert_eq!(
+            safety_refuse(Path::new("/proc"), &opts),
+            Some("protected filesystem")
+        );
+    }
 }

@@ -1,4 +1,6 @@
 //! `vanish check`: диагностика пути БЕЗ записи. Всё read-only.
+//! Diagnostic reports intentionally include volume/device paths and opener
+//! details; they do not share the wipe report's hashed-name privacy contract.
 
 use serde::Serialize;
 use std::path::Path;
@@ -6,9 +8,11 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+use crate::config::Options;
 use crate::error::Result;
-use crate::fsinfo::{JournalState, VolumeInfo};
+use crate::fsinfo::VolumeInfo;
 use crate::platform::{Opener, Platform, SwapEntry};
+use crate::strategy::decide;
 
 #[derive(Debug, Serialize)]
 pub struct CheckEntry {
@@ -31,13 +35,34 @@ pub struct CheckReport {
 }
 
 /// Собрать диагностику по списку путей.
-pub fn run(plat: &dyn Platform, paths: &[std::path::PathBuf]) -> Result<CheckReport> {
+///
+/// Per-path failures are reported inside the entry instead of aborting the whole
+/// report: `check` is diagnostic and must stay usable when, for example, another
+/// user's `/proc/<pid>/fd` is unreadable. A global swap query failure still
+/// fails the report (there is no entry to attach it to).
+pub fn run(
+    plat: &dyn Platform,
+    paths: &[std::path::PathBuf],
+    opts: &Options,
+) -> Result<CheckReport> {
     let mut entries = Vec::new();
     for p in paths {
-        let e = check_one(plat, p)?;
-        entries.push(e);
+        match check_one(plat, p, opts) {
+            Ok(entry) => entries.push(entry),
+            Err(error) => entries.push(CheckEntry {
+                name_hash: crate::util::name_sha256(p),
+                exists: false,
+                kind: "error".into(),
+                size: None,
+                nlink: None,
+                volume: None,
+                openers: Vec::new(),
+                hardlink_refusal: false,
+                verdict: format!("проверка не удалась: {}: {}", error.kind(), error),
+            }),
+        }
     }
-    let swap = plat.swap_active().unwrap_or_else(|_| Vec::new());
+    let swap = plat.swap_active()?;
     Ok(CheckReport {
         backend: plat.name(),
         swap,
@@ -45,7 +70,7 @@ pub fn run(plat: &dyn Platform, paths: &[std::path::PathBuf]) -> Result<CheckRep
     })
 }
 
-fn check_one(plat: &dyn Platform, p: &Path) -> Result<CheckEntry> {
+fn check_one(plat: &dyn Platform, p: &Path, opts: &Options) -> Result<CheckEntry> {
     let mut e = CheckEntry {
         name_hash: crate::util::name_sha256(p),
         exists: false,
@@ -59,74 +84,81 @@ fn check_one(plat: &dyn Platform, p: &Path) -> Result<CheckEntry> {
     };
     let md = match std::fs::symlink_metadata(p) {
         Ok(m) => m,
-        Err(_) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             e.verdict = "нет такой цели; удалять нечего".into();
             return Ok(e);
         }
+        Err(error) => return Err(error.into()),
     };
     e.exists = true;
     if md.is_symlink() {
-        e.verdict = "symlink-target is wiped elsewhere; vanish не следует ссылкам".into();
+        e.kind = "symlink".into();
+        e.verdict = "symlink; not followed".into();
         return Ok(e);
     }
-    let mut reason: Option<String> = None;
-    let (dev, ino, nlink) = (
-        md.dev(),
-        md.ino(),
-        md.nlink(),
-    );
+    if !md.is_dir() && !md.is_file() {
+        e.kind = "special".into();
+        e.verdict = "отказ: не обычный файл или каталог; не затираем".into();
+        return Ok(e);
+    }
+    let mut refusals = Vec::new();
+    let mut warnings = Vec::new();
+    let (dev, ino, nlink) = (md.dev(), md.ino(), md.nlink());
     if md.is_dir() {
         e.kind = "dir".into();
-        let v = Some(plat.fsinfo(p).unwrap_or_else(|er| fallback_info(&er.to_string())));
-        e.volume = v;
-        reason = match refusal_from(&e.volume, &crate::fsinfo::JournalState::Unknown) {
-            Some(r) => Some(r),
-            None => None,
-        };
     } else {
         e.kind = "file".into();
         e.size = Some(md.len());
         e.nlink = Some(nlink as u32);
-        let v = Some(plat.fsinfo(p).unwrap_or_else(|er| fallback_info(&er.to_string())));
-        e.volume = v;
         if nlink > 1 {
             e.hardlink_refusal = true;
-            reason = Some(format!("nlink={}; откажется без --wipe-all-hardlinks", nlink));
+            refusals.push(format!(
+                "nlink={}; откажется без --wipe-all-hardlinks",
+                nlink
+            ));
         }
     }
-    e.openers = plat.openers(dev, ino).unwrap_or_default();
-    if !e.openers.is_empty() {
-        reason = Some(format!(
-            "открыт процессами {:?}; откажется",
-            e.openers.iter().map(|o| o.pid).collect::<Vec<_>>()
-        ));
+    let volume = match plat.fsinfo(p) {
+        Ok(volume) => Some(volume),
+        Err(error) => {
+            warnings.push(format!("fsinfo недоступен: {}", error.kind()));
+            None
+        }
+    };
+    if let Some(volume) = &volume {
+        if let Err(error) = decide(md.is_file(), volume, opts) {
+            refusals.push(format!("{}: {}", error.kind(), error));
+        }
     }
-    let vol = e.volume.clone().unwrap();
-    let j = vol.journal;
-    let _ = j.to_str();
-    e.verdict = reason
-        .map(|r| format!("отказ: {}", r))
-        .unwrap_or_else(|| vol.protective_summary());
+    match plat.openers(dev, ino) {
+        Ok(openers) => {
+            if !openers.is_empty() {
+                refusals.push(format!(
+                    "открыт процессами {:?}; откажется",
+                    openers.iter().map(|o| o.pid).collect::<Vec<_>>()
+                ));
+            }
+            e.openers = openers;
+        }
+        Err(error) => warnings.push(format!(
+            "не удалось проверить открытые дескрипторы: {}",
+            error.kind()
+        )),
+    }
+    e.verdict = if !refusals.is_empty() {
+        let mut verdict = format!("отказ: {}", refusals.join("; "));
+        if !warnings.is_empty() {
+            verdict.push_str(&format!("; предупреждения: {}", warnings.join("; ")));
+        }
+        verdict
+    } else if !warnings.is_empty() {
+        format!("диагностика неполна: {}", warnings.join("; "))
+    } else {
+        match &volume {
+            Some(volume) => volume.protective_summary(),
+            None => "диагностика неполна: нет данных о файловой системе".into(),
+        }
+    };
+    e.volume = volume;
     Ok(e)
-}
-
-fn refusal_from(_v: &Option<VolumeInfo>, _j: &JournalState) -> Option<String> {
-    None // уточнено в check_one
-}
-
-fn fallback_info(msg: &str) -> VolumeInfo {
-    VolumeInfo {
-        fs: crate::fsinfo::FsKind::Other,
-        fs_name: format!("unknown ({})", msg),
-        mount: "?".into(),
-        device: None,
-        device_kind: crate::fsinfo::DeviceKind::Unknown,
-        encrypted: crate::fsinfo::EncryptionState::Unknown,
-        journal: JournalState::Unknown,
-        cow: false,
-        ro_mount: false,
-        swap_sharing_fs: false,
-        swap_pages_possible: false,
-        ssd_chipoff_protected: false,
-    }
 }

@@ -28,9 +28,20 @@ pub enum FsKind {
 }
 
 impl FsKind {
-    /// («Поддержанная» ФС: конвейер wipe физически корректен.)
+    /// Explicitly supported logical-deletion pipelines, not physical-erasure guarantees.
+    /// COW filesystems still require explicit acceptance in `strategy::decide`.
     pub fn is_supported_pipeline(self) -> bool {
-        !matches!(self, FsKind::Nfs | FsKind::Cifs | FsKind::Fuse | FsKind::Overlayfs)
+        matches!(
+            self,
+            FsKind::Ext4
+                | FsKind::Xfs
+                | FsKind::Vfat
+                | FsKind::Exfat
+                | FsKind::Btrfs
+                | FsKind::Zfs
+                | FsKind::Tmpfs
+                | FsKind::Ramfs
+        )
     }
 
     pub fn is_pseudo(self) -> bool {
@@ -100,20 +111,22 @@ pub struct VolumeInfo {
 }
 
 impl VolumeInfo {
-    /// Короткая человеческая формулировка гарантий на этом томе.
+    /// Диагностическая сводка, не сертификат физического санитирования.
     pub fn protective_summary(&self) -> String {
         if self.encrypted == EncryptionState::Encrypted {
-            "шифрованный том: на носителе шифротекст; ключевая рекомендация — уничтожение ключа".into()
+            "шифрованный том: на носителе шифротекст; ключевая рекомендация — уничтожение ключа"
+                .into()
         } else if self.cow {
-            "COW-ФС: старые блоки могут оставаться в снапшотах; перезапись на месте бессмысленна".into()
+            "COW-ФС: старые блоки могут оставаться в снапшотах; перезапись на месте бессмысленна"
+                .into()
         } else if self.fs.is_ram() {
-            "RAM-ФС: unlink достаточно".into()
+            "RAM-ФС: логическое удаление; прежние копии в swap не исключены".into()
         } else if self.device_kind == DeviceKind::Ssd {
-            "SSD без шифрования: лучшее достижимое; против chip-off гарантии нет".into()
+            "SSD: логическое удаление/deallocation; физическое санитирование не доказано".into()
         } else if self.device_kind == DeviceKind::Rotational {
-            "HDD: однопроходная перезапись достаточна (NIST 800-88)".into()
+            "HDD: логическая перезапись; журналы, копии и remapped-блоки не покрываются".into()
         } else {
-            "носитель не классифицирован; стратегия — лучшее достижимое".into()
+            "носитель не классифицирован; физических гарантий нет".into()
         }
     }
 }

@@ -4,10 +4,8 @@ use std::path::{Path, PathBuf};
 
 use vanish_core::error::{Result, VanishError};
 use vanish_core::fsinfo::VolumeInfo;
-use vanish_core::platform::{
-    Extent, Opener, Platform, SwapEntry, Target, WipeHandle,
-};
 use vanish_core::pattern::PatternStream;
+use vanish_core::platform::{Extent, Opener, Platform, SwapEntry, Target, WipeHandle};
 
 pub struct MacosPlatform;
 
@@ -21,7 +19,9 @@ impl Platform for MacosPlatform {
     }
 
     fn fsinfo(&self, _path: &Path) -> Result<VolumeInfo> {
-        Err(VanishError::UnsupportedFs("backend-macos в v0.1 — заглушка".into()))
+        Err(VanishError::UnsupportedFs(
+            "backend-macos в v0.1 — заглушка".into(),
+        ))
     }
 
     fn openers(&self, _dev: u64, _ino: u64) -> Result<Vec<Opener>> {
@@ -29,7 +29,9 @@ impl Platform for MacosPlatform {
     }
 
     fn open_handle(&self, _t: &Target) -> Result<Box<dyn WipeHandle>> {
-        Err(VanishError::UnsupportedFs("backend-macos в v0.1 — заглушка".into()))
+        Err(VanishError::UnsupportedFs(
+            "backend-macos в v0.1 — заглушка".into(),
+        ))
     }
 
     fn stream_names(&self, _t: &Target) -> Result<Vec<(String, u64)>> {
@@ -41,19 +43,27 @@ impl Platform for MacosPlatform {
     }
 
     fn rename_to_tail(&self, _t: &Target) -> Result<String> {
-        Err(VanishError::UnsupportedFs("backend-macos в v0.1 — заглушка".into()))
+        Err(VanishError::UnsupportedFs(
+            "backend-macos в v0.1 — заглушка".into(),
+        ))
     }
 
     fn fsync_dir(&self, _dir: &Path) -> Result<()> {
-        Err(VanishError::UnsupportedFs("backend-macos в v0.1 — заглушка".into()))
+        Err(VanishError::UnsupportedFs(
+            "backend-macos в v0.1 — заглушка".into(),
+        ))
     }
 
     fn unlink(&self, _t: &Target, _tail: &str) -> Result<()> {
-        Err(VanishError::UnsupportedFs("backend-macos в v0.1 — заглушка".into()))
+        Err(VanishError::UnsupportedFs(
+            "backend-macos в v0.1 — заглушка".into(),
+        ))
     }
 
     fn rmdir(&self, _t: &Target, _tail: &str) -> Result<()> {
-        Err(VanishError::UnsupportedFs("backend-macos в v0.1 — заглушка".into()))
+        Err(VanishError::UnsupportedFs(
+            "backend-macos в v0.1 — заглушка".into(),
+        ))
     }
 
     fn trim_mount(&self, _mount: &Path) -> Result<bool> {

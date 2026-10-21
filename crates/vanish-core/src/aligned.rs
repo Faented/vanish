@@ -18,8 +18,8 @@ unsafe impl Send for AlignedBuf {}
 impl AlignedBuf {
     pub fn zeroed(len: usize) -> Self {
         let cap = len.next_multiple_of(4096);
-        let layout = std::alloc::Layout::from_size_align(cap.max(ALIGN), ALIGN)
-            .expect("aligned layout");
+        let layout =
+            std::alloc::Layout::from_size_align(cap.max(ALIGN), ALIGN).expect("aligned layout");
         unsafe {
             let ptr = std::alloc::alloc_zeroed(layout);
             let ptr = std::ptr::NonNull::new(ptr).expect("alloc_zeroed");

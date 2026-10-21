@@ -13,7 +13,7 @@ pub enum Level {
     Error,
 }
 
-/// Диагностические гарантии, точно по контракту.
+/// Diagnostic observations, not proof of physical sanitization or key erasure.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Guarantees {
     pub ssd_chipoff_protected: bool,

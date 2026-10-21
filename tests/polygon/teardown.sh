@@ -1,33 +1,37 @@
 #!/usr/bin/env bash
-# M3-полигон: разборка.  ЗАПУСК:  sudo bash tests/polygon/teardown.sh
-# Идемпотентно: безопасно запускать повторно; снимает ТОЛЬКО наш loop
-# (по backing-файлу disk.img) — чужие loop-устройства не трогает.
-set -u
-
-HERE="$(cd "$(dirname "$0")" && pwd)"
-IMG="$HERE/disk.img"
-MNT=/mnt/vanish-poly
-
-# 1) отмонтировать точку, убрать пустой каталог
-umount "$MNT" 2>/dev/null || true
-rmdir "$MNT" 2>/dev/null || true
-
-# 2) отсоединить ровно наш loop (найден по backing-файлу)
-LO="$(losetup -j "$IMG" 2>/dev/null | cut -d: -f1 | head -1)"
-if [ -n "${LO:-}" ]; then
-  umount "$LO" 2>/dev/null || true
-  if losetup -d "$LO" 2>/dev/null; then
-    echo "[teardown] loop отсоединён: $LO"
-  fi
+# sudo bash tests/polygon/teardown.sh
+# Only this run's loop and image are removed. Audit/PhotoRec output is retained.
+set -euo pipefail
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+source "$HERE/common.sh"
+init
+if [[ ! -e "$BASE/current" && ! -L "$BASE/current" ]]; then
+  printf 'No active polygon run. Legacy /tmp state and unrelated mounts are never touched.\n'
+  exit 0
 fi
-
-# 3) образ и временные артефакты
-rm -f "$IMG"
-rm -f /tmp/vanish_poly_loop
-rm -rf /tmp/vanish_photorec /tmp/vanish_photorec_u
-rm -f "$HOME/photorec.log" 2>/dev/null || true
-
-# 4) отчистит ли дисковое пространство spot-check: образ не должен существовать
-if [ -e "$IMG" ]; then echo "[teardown] ВНИМАНИЕ: не удалось удалить $IMG"; exit 1; fi
-
-echo "[teardown] полигон разобран (loop/mnt/образ/артефакты)."
+load_run
+if [[ -s "$RUN/loop" ]]; then
+  check_loop
+  if findmnt --mountpoint "$MNT" >/dev/null; then
+    unmount_owned
+  else
+    [[ $? == 1 ]] || die 'cannot inspect mountpoint'
+    check_unmounted
+  fi
+  check_loop
+  check_unmounted
+  losetup --detach "$LOOP" || die 'detach failed; image retained'
+fi
+# Never unlink an image still associated with any loop, even after detach.
+associations=$(losetup --associated "$IMG" --noheadings --output NAME)
+[[ -z $associations ]] || die 'image still associated with a loop; refusing cleanup'
+if findmnt --mountpoint "$MNT" >/dev/null; then die 'mountpoint still occupied'; else
+  [[ $? == 1 ]] || die 'cannot inspect mountpoint'
+fi
+private_file "$IMG"
+[[ $(stat -c %d:%i -- "$IMG") == "$(cat -- "$RUN/image.identity")" ]] || die 'image identity changed'
+rmdir -- "$MNT" || die 'mountpoint not empty; image retained'
+rm -- "$IMG"
+set_status torn-down
+rm -- "$BASE/current"
+printf 'Owned loop/image removed. Audit state and any manual PhotoRec results retained in %s\n' "$RUN"

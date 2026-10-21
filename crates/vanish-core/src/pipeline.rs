@@ -1,6 +1,6 @@
 //! Конвейер: один целевой путь → решить → wipe → отчёт-событие.
 //! Порядок шагов (контракт §6): probe-проверки → занятость → хардлинки
-//! → rename-hide → open+bypass-IO → потоки → проходы записи → punch →
+//! → rename-hide+fsync(dir) → open+bypass-IO → потоки → запись+sync+verify → punch →
 //! fadvise → truncate0+sync → unlink → fsync(dir).
 
 use crate::config::Options;
@@ -8,7 +8,8 @@ use crate::error::{Result, VanishError};
 use crate::fsinfo::VolumeInfo;
 use crate::pattern::PatternStream;
 use crate::platform::{Platform, Target};
-use crate::report::{Guarantees, RunReport, TargetEvent, Timer};use crate::signal::shutdown_requested;
+use crate::report::{Guarantees, RunReport, TargetEvent, Timer};
+use crate::signal::shutdown_requested;
 use crate::strategy::decide;
 use crate::util;
 
@@ -33,10 +34,13 @@ impl<'a> Pipeline<'a> {
     /// Полный проход одного PATH (файл или папка).
     pub fn wipe_any(&mut self, root: &std::path::Path) {
         let timer = Timer::start();
+        if self.skip_if_cancelled("file", root) {
+            return;
+        }
         let md = match std::fs::symlink_metadata(root) {
             Ok(m) => m,
             Err(e) => {
-                self.fail_event("file", root, "io", e.to_string(), timer);
+                self.bad_event("file", root, &e.into(), timer);
                 return;
             }
         };
@@ -44,8 +48,24 @@ impl<'a> Pipeline<'a> {
             self.reject_event("file", root, "symlink", "не затираем".into(), timer);
             return;
         }
+        if !root.is_absolute() {
+            // The backend pins parent components and requires an absolute,
+            // consistent target; checking that only after rename would hide the
+            // original name first and then reject an already renamed target.
+            self.reject_event(
+                if md.is_dir() { "dir" } else { "file" },
+                root,
+                "unsafe_path",
+                "нужен абсолютный путь".into(),
+                timer,
+            );
+            return;
+        }
         if md.is_dir() {
             self.wipe_tree(root, timer);
+            return;
+        } else if !md.is_file() {
+            self.reject_event("file", root, "unsafe_path", "не обычный файл".into(), timer);
             return;
         } else {
             let target = Target::from_parts(
@@ -71,13 +91,16 @@ impl<'a> Pipeline<'a> {
             }
         };
         for note in &plan.skipped {
-            self.report.note(format!("skip ({}): {}", note.0.display(), note.1));
+            self.skipped_event("file", &note.0, &note.1);
         }
         let n_files = plan.files.len();
         let n_dirs = plan.dirs.len();
         for f in &plan.files {
+            if self.skip_if_cancelled("file", f) {
+                continue;
+            }
             match std::fs::symlink_metadata(f) {
-                Ok(md) if !md.is_dir() => {
+                Ok(md) if md.is_file() && !md.is_symlink() => {
                     let t = Target::from_parts(
                         f.clone(),
                         md.dev(),
@@ -89,22 +112,39 @@ impl<'a> Pipeline<'a> {
                         self.bad_event("file", f, &e, Timer::start());
                     }
                 }
-                _ => {}
-            }
-            if shutdown_requested() {
-                self.report
-                    .note("SIGINT: оставшиеся цели не тронуты");
-                break;
+                Ok(_) => self.record_error(
+                    "file",
+                    f,
+                    &VanishError::UnsafePath("тип цели изменился".into()),
+                ),
+                Err(e) => self.record_error("file", f, &e.into()),
             }
         }
         for d in &plan.dirs {
+            if self.skip_if_cancelled("dir", d) {
+                continue;
+            }
+            if self.opts.dry_run {
+                // In a dry-run nothing was unlinked, so every parent directory
+                // is still non-empty. Report the plan instead of a misleading
+                // "directory is not empty" skip.
+                if let Err(error) = self.dry_run_event(d, false, Timer::start()) {
+                    self.record_error("dir", d, &error);
+                }
+                continue;
+            }
             match std::fs::symlink_metadata(d) {
                 Ok(md) if md.is_dir() => {
                     // Не трогаем непустой каталог: в нём остались
                     // отклонённые/пропущенные цели — «failed» тут был бы ложью.
-                    let empty = std::fs::read_dir(d)
-                        .map(|mut rd| rd.next().is_none())
-                        .unwrap_or(false);
+                    let empty = match std::fs::read_dir(d).and_then(|mut rd| rd.next().transpose())
+                    {
+                        Ok(entry) => entry.is_none(),
+                        Err(e) => {
+                            self.record_error("dir", d, &e.into());
+                            continue;
+                        }
+                    };
                     if !empty {
                         let ev = TargetEvent {
                             kind: "dir".into(),
@@ -136,10 +176,12 @@ impl<'a> Pipeline<'a> {
                         self.bad_event("dir", d, &e, Timer::start());
                     }
                 }
-                _ => {}
-            }
-            if shutdown_requested() {
-                break;
+                Ok(_) => self.record_error(
+                    "dir",
+                    d,
+                    &VanishError::UnsafePath("тип цели изменился".into()),
+                ),
+                Err(e) => self.record_error("dir", d, &e.into()),
             }
         }
         self.report.note(format!(
@@ -151,9 +193,22 @@ impl<'a> Pipeline<'a> {
     }
 
     /// Папка: действия — verify-nlink=1? Для каталогов nlink>1 нормально
-    /// (родитель + младенцы); не отказываем. rename → rmdir → fsync(dir).
+    /// (родитель + младенцы); не отказываем. rename → fsync(dir) → rmdir → fsync(dir).
     pub fn wipe_dir(&mut self, mut t: Target) -> Result<()> {
         let timer = Timer::start();
+        if self.skip_if_cancelled("dir", &t.orig_abs) {
+            return Ok(());
+        }
+        if !t.abs.is_absolute() || !t.parent.is_absolute() {
+            return Err(VanishError::UnsafePath(
+                "target directory path must be absolute".into(),
+            ));
+        }
+        if !self.opts.rename && t.name.to_str().is_none() {
+            return Err(VanishError::UnsafePath(
+                "non-UTF8 basename requires rename before string-based removal".into(),
+            ));
+        }
         if self.opts.dry_run {
             self.dry_run_event(&t.abs, false, timer)?;
             return Ok(());
@@ -164,6 +219,8 @@ impl<'a> Pipeline<'a> {
             let tl = self.platform.rename_to_tail(&t)?;
             t.abs = t.parent.join(&tl);
             t.name = tl.clone().into();
+            // Persist the recovery name before performing irreversible work.
+            self.platform.fsync_dir(&t.parent)?;
             Some(tl)
         } else {
             None
@@ -191,13 +248,28 @@ impl<'a> Pipeline<'a> {
     /// Универсальная обработка одного целевого inode (файл).
     pub fn wipe_target(&mut self, mut target: Target, allow_rename: bool) -> Result<()> {
         let timer = Timer::start();
+        if self.skip_if_cancelled("file", &target.orig_abs) {
+            return Ok(());
+        }
+        if !target.abs.is_absolute() || !target.parent.is_absolute() {
+            return Err(VanishError::UnsafePath(
+                "target file path must be absolute".into(),
+            ));
+        }
+        if !(allow_rename && self.opts.rename) && target.name.to_str().is_none() {
+            return Err(VanishError::UnsafePath(
+                "non-UTF8 basename requires rename before string-based removal".into(),
+            ));
+        }
         if self.opts.dry_run {
             self.dry_run_event(&target.abs, true, timer)?;
             return Ok(());
         }
         // Инвариант 5: nlink>1 — отказ.
         if target.nlink > 1 && !self.opts.wipe_all_hardlinks {
-            return Err(VanishError::HardLinks { nlink: target.nlink });
+            return Err(VanishError::HardLinks {
+                nlink: target.nlink,
+            });
         }
         let vinfo = self.platform.fsinfo(&target.abs)?;
         let strategy = decide(true, &vinfo, self.opts)?;
@@ -213,18 +285,13 @@ impl<'a> Pipeline<'a> {
             let tl = self.platform.rename_to_tail(&target)?;
             target.abs = target.parent.join(&tl);
             target.name = tl.clone().into();
+            self.platform.fsync_dir(&target.parent)?;
             Some(tl)
         } else {
             None
         };
         let seed = util::random_seed32();
-        let wipe_handle = match self.platform.open_handle(&target) {
-            Ok(h) => h,
-            Err(e) => {
-                self.platform.fsync_dir(&target.parent).ok();
-                return Err(e);
-            }
-        };
+        let wipe_handle = self.platform.open_handle(&target)?;
         if wipe_handle.dev_ino() != (target.dev, target.ino) {
             drop(wipe_handle);
             return Err(VanishError::IdentityMismatch(format!(
@@ -234,42 +301,48 @@ impl<'a> Pipeline<'a> {
         }
         let mut wipe_handle = wipe_handle;
         let mut warnings: Vec<String> = vec![];
+        if target.nlink > 1 {
+            // --wipe-all-hardlinks only permits the operation; it does not
+            // enumerate other names. State that plainly instead of implying a
+            // cascade that never happened.
+            warnings.push("hardlinks: другие имена этого inode не удалены".into());
+        }
         let mut bytes_wiped: u64 = 0;
         // Потоки: затираем по умолчанию.
         if !self.opts.keep_streams {
             for (name, _sz) in self.platform.stream_names(&target)? {
                 if let Err(e) = self.platform.erase_stream(&target, &name) {
-                    warnings.push(format!("поток {}: не удалён ({})", name, e));
+                    warnings.push(format!(
+                        "stream-hash {}: не удалён ({})",
+                        util::name_sha256(std::path::Path::new(&name)),
+                        e.kind()
+                    ));
                 }
             }
         }
         // Проходы записи (extent-aware).
         if strategy.do_overwrite() {
-            let len = wipe_handle.len().unwrap_or(target.size);
-            bytes_wiped = len;
+            let len = wipe_handle.len()?;
             let ranges: Vec<(u64, u64)> = match wipe_handle.extents()? {
-                Some(exs) if !exs.is_empty() => {
-                    exs.iter().map(|e| (e.logical, e.len)).collect()
-                }
+                Some(exs) if !exs.is_empty() => exs.iter().map(|e| (e.logical, e.len)).collect(),
                 _ => vec![(0, len)],
             };
+            // `bytes` in the report means bytes actually overwritten (sum of
+            // extents), not the logical file size (which overstates sparse files).
+            bytes_wiped = ranges.iter().map(|(_, len)| *len).sum();
             for p in 0..self.opts.effective_passes() {
                 for (off, rlen) in &ranges {
                     let mut gen = PatternStream::new(self.opts.pattern, p, seed);
                     wipe_handle.overwrite(*off, *rlen, &mut gen)?;
-                    if self.opts.verify {
+                }
+                // Verification must observe a completed, durable pass, not just
+                // dirty cache pages. SIGINT never shortens an extent or pass.
+                wipe_handle.sync()?;
+                if self.opts.verify {
+                    for (off, rlen) in &ranges {
                         let mut vgen = PatternStream::new(self.opts.pattern, p, seed);
                         wipe_handle.verify(*off, *rlen, &mut vgen)?;
                     }
-                    if shutdown_requested() {
-                        break;
-                    }
-                }
-                wipe_handle.sync()?;
-                if shutdown_requested() {
-                    self.report
-                        .note("SIGINT: текущий файл доводится до конца, остальные отменены");
-                    break;
                 }
             }
         }
@@ -278,25 +351,19 @@ impl<'a> Pipeline<'a> {
             match wipe_handle.punch() {
                 Ok(true) => {}
                 Ok(false) => warnings.push("punch-hole: не поддержан ФС".into()),
-                Err(e) => warnings.push(format!("punch-hole: {}", e)),
+                Err(e) => warnings.push(format!("punch-hole: {}", e.kind())),
             }
         }
         if let Err(e) = wipe_handle.dontneed() {
-            warnings.push(format!("fadvise: {}", e));
+            warnings.push(format!("fadvise: {}", e.kind()));
         }
         // Финальный ход: truncate0 → sync → unlink (инвариант 4).
         wipe_handle.truncate0()?;
         wipe_handle.sync()?;
         drop(wipe_handle);
-        if let Err(e) = self
-            .platform
-            .unlink(&target, &target.name.to_string_lossy())
-        {
-            warnings.push(format!("unlink: {} (хвост остался для recovery)", e));
-        }
-        if let Err(e) = self.platform.fsync_dir(&target.parent) {
-            warnings.push(format!("fsync(dir): {}", e));
-        }
+        self.platform
+            .unlink(&target, &target.name.to_string_lossy())?;
+        self.platform.fsync_dir(&target.parent)?;
         if self.opts.trim_mount {
             let mount: std::path::PathBuf = vinfo.mount.clone().into();
             if !self.platform.trim_mount(&mount)? {
@@ -319,35 +386,22 @@ impl<'a> Pipeline<'a> {
         Ok(())
     }
 
-    fn seed_of(&self, _t: &Target) -> [u8; 32] {
-        util::random_seed32()
-    }
-
     fn guarantees(&self, v: &VolumeInfo) -> Guarantees {
         Guarantees {
             ssd_chipoff_protected: v.ssd_chipoff_protected,
-            journal_contains_old_names: matches!(
-                v.journal,
-                crate::fsinfo::JournalState::Active
-            ),
+            journal_contains_old_names: matches!(v.journal, crate::fsinfo::JournalState::Active),
             swap_pages_possible: v.swap_pages_possible,
             encrypted_at_rest: v.encrypted == crate::fsinfo::EncryptionState::Encrypted,
         }
     }
 
-    fn dry_run_event(
-        &mut self,
-        path: &std::path::Path,
-        is_file: bool,
-        timer: Timer,
-    ) -> Result<()> {
+    fn dry_run_event(&mut self, path: &std::path::Path, is_file: bool, timer: Timer) -> Result<()> {
         // fd-цель может исчезнуть к моменту dry-run; это не ошибка, а «пустая цель».
-        let md = std::fs::symlink_metadata(path).ok();
         let vinfo = self.platform.fsinfo(path)?;
         let plan = match decide(is_file, &vinfo, self.opts) {
             Ok(s) => s.to_str().to_string(),
             Err(e) => {
-                self.reject_event("file", path, e.kind(), e.to_string(), timer);
+                self.bad_event(if is_file { "file" } else { "dir" }, path, &e, timer);
                 return Ok(());
             }
         };
@@ -358,7 +412,8 @@ impl<'a> Pipeline<'a> {
             strategy: Some(plan),
             status: "skipped".into(),
             reason: Some("dry-run".into()),
-            bytes: md.as_ref().map(|m| m.len()).unwrap_or(0),
+            // Nothing was written: planned size is not "bytes overwritten".
+            bytes: 0,
             warnings: vec![],
             guarantees: Some(self.guarantees(&vinfo)),
             elapsed_ms: timer.ms(),
@@ -396,7 +451,7 @@ impl<'a> Pipeline<'a> {
         path: &std::path::Path,
         reason_kind: &str,
         detail: String,
-        _timer: Timer,
+        timer: Timer,
     ) {
         let ev = TargetEvent {
             kind: kind.into(),
@@ -408,15 +463,55 @@ impl<'a> Pipeline<'a> {
             bytes: 0,
             warnings: vec![],
             guarantees: None,
-            elapsed_ms: 0,
+            elapsed_ms: timer.ms(),
         };
         self.report.push(ev);
     }
 
     fn bad_event(&mut self, kind: &str, path: &std::path::Path, e: &VanishError, timer: Timer) {
+        // Backend errors may embed original paths, stream names or mount names.
+        // Never serialize their free-form Display text into the report.
+        let detail = match e {
+            VanishError::VerifyMismatch { offset } => format!("offset={offset}"),
+            VanishError::HardLinks { nlink } => format!("nlink={nlink}"),
+            VanishError::Io(e) => format!("{:?}", e.kind()),
+            _ => "детали скрыты".into(),
+        };
         match e {
-            VanishError::Io(_) => self.fail_event(kind, path, e.kind(), e.to_string(), timer),
-            _ => self.reject_event(kind, path, e.kind(), e.to_string(), timer),
+            VanishError::Io(_) | VanishError::VerifyMismatch { .. } | VanishError::Local(_) => {
+                self.fail_event(kind, path, e.kind(), detail, timer)
+            }
+            _ => self.reject_event(kind, path, e.kind(), detail, timer),
+        }
+    }
+
+    /// Record an error returned by a Result-based entry point, without leaking
+    /// backend-provided paths or other free-form details into the report.
+    pub fn record_error(&mut self, kind: &str, path: &std::path::Path, error: &VanishError) {
+        self.bad_event(kind, path, error, Timer::start());
+    }
+
+    pub(crate) fn skipped_event(&mut self, kind: &str, path: &std::path::Path, reason: &str) {
+        self.report.push(TargetEvent {
+            kind: kind.into(),
+            name_hash: util::name_sha256(path),
+            tail: None,
+            strategy: None,
+            status: "skipped".into(),
+            reason: Some(reason.into()),
+            bytes: 0,
+            warnings: vec![],
+            guarantees: None,
+            elapsed_ms: 0,
+        });
+    }
+
+    fn skip_if_cancelled(&mut self, kind: &str, path: &std::path::Path) -> bool {
+        if shutdown_requested() {
+            self.skipped_event(kind, path, "SIGINT/SIGTERM: цель не начата");
+            true
+        } else {
+            false
         }
     }
 }

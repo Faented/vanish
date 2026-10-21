@@ -1,0 +1,38 @@
+name: safety checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: ["1.85.0", stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --release --locked
+      - run: cargo build --release --locked
+      - name: Formatting
+        if: matrix.toolchain == 'stable'
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all -- --check
+  repository:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          for script in scripts/*.sh .githooks/pre-commit tests/polygon/*.sh; do
+            bash -n "$script"
+          done
+      - run: python3 scripts/test-security.py
+      - run: bash scripts/security-audit.sh

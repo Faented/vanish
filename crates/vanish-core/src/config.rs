@@ -13,7 +13,9 @@ pub enum PatternChoice {
 }
 
 impl Default for PatternChoice {
-    fn default() -> Self { PatternChoice::Random }
+    fn default() -> Self {
+        PatternChoice::Random
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -34,13 +36,13 @@ pub struct Options {
     /// `--keep-streams`: не затирать ADS/xattr (по умолчанию затираем)
     pub keep_streams: bool,
     pub wipe_all_hardlinks: bool,
+    /// Reserved: rejected until verified swap disabling/restoration is implemented.
     pub disable_swap_for_wipe: bool,
     pub no_preserve_root: bool,
     /// не спускаться в другие ФС при рекурсии
     pub xdev: bool,
     pub json: bool,
     pub report_file: Option<std::path::PathBuf>,
-    pub yes: bool,
 }
 
 impl Default for Options {
@@ -61,7 +63,6 @@ impl Default for Options {
             xdev: false,
             json: false,
             report_file: None,
-            yes: false,
             disable_swap_for_wipe: false,
         }
     }

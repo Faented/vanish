@@ -15,6 +15,12 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 vanish-core = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 backend-linux = { workspace = true }
-backend-windows = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 backend-macos = { workspace = true }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dependencies]
+backend-windows = { workspace = true }

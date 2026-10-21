@@ -8,8 +8,12 @@ fn fixture() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("vanish-cli-test-{}-{}", std::process::id(), stamp));
+    let base = if std::path::Path::new("/tmp/opencode").is_dir() {
+        PathBuf::from("/tmp/opencode")
+    } else {
+        std::env::temp_dir()
+    };
+    let path = base.join(format!("vanish-cli-test-{}-{}", std::process::id(), stamp));
     fs::create_dir(&path).expect("fixture directory");
     path
 }
@@ -100,4 +104,210 @@ fn freespace_dry_run_does_not_create_a_scratch_file() {
     assert!(stdout.contains("no file created or written"));
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn report_cannot_overwrite_target_or_existing_file() {
+    let root = fixture();
+    let target = root.join("keep");
+    let report = root.join("existing-report");
+    fs::write(&target, b"keep target").unwrap();
+    fs::write(&report, b"keep report").unwrap();
+    for destination in [&target, &report] {
+        let output = run(&[
+            "--report",
+            destination.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(output.status.code(), Some(4));
+        assert_eq!(fs::read(&target).unwrap(), b"keep target");
+        assert_eq!(fs::read(&report).unwrap(), b"keep report");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn report_inside_target_tree_is_rejected_even_in_dry_run() {
+    let root = fixture();
+    let tree = root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    let target = tree.join("keep");
+    let report = tree.join("new-report");
+    fs::write(&target, b"keep").unwrap();
+    let output = run(&[
+        "--dry-run",
+        "--report",
+        report.to_str().unwrap(),
+        tree.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(!report.exists());
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn report_symlink_and_symlink_parent_are_rejected() {
+    let root = fixture();
+    let target = root.join("keep");
+    fs::write(&target, b"keep").unwrap();
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let parent = root.join("parent");
+    let alias = root.join("alias");
+    fs::create_dir(&parent).unwrap();
+    std::os::unix::fs::symlink(&parent, &alias).unwrap();
+    for destination in [link, alias.join("new-report")] {
+        let output = run(&[
+            "--report",
+            destination.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(output.status.code(), Some(4));
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+    assert_eq!(fs::read_dir(parent).unwrap().count(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn report_is_private_and_matches_stdout() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = fixture();
+    let target = root.join("keep");
+    let report = root.join("report");
+    fs::write(&target, b"keep").unwrap();
+    let output = run(&[
+        "--dry-run",
+        "--json",
+        "--report",
+        report.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(fs::read(&report).unwrap(), output.stdout);
+    assert_eq!(
+        fs::metadata(report).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn device_execution_is_disabled_and_preserves_regular_file() {
+    let root = fixture();
+    let supplied = root.join("owned-file");
+    fs::write(&supplied, b"keep").unwrap();
+    let output = run(&["device", supplied.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("device execution disabled"));
+    assert_eq!(fs::read(&supplied).unwrap(), b"keep");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn overlapping_targets_are_rejected_before_deletion() {
+    let root = fixture();
+    let target = root.join("keep");
+    fs::write(&target, b"keep").unwrap();
+    let output = run(&["--json", root.to_str().unwrap(), target.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(root.to_str().unwrap()));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stdout_returns_execution_error() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    let root = fixture();
+    let target = root.join("keep");
+    fs::write(&target, b"keep").unwrap();
+    for json in [false, true] {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        drop(reader);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vanish"));
+        command.arg("--dry-run").arg(&target);
+        if json {
+            command.arg("--json");
+        }
+        let fd: OwnedFd = writer.into();
+        let status = command
+            .stdout(Stdio::from(fd))
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(4));
+    }
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn freespace_checks_policy_before_creating_scratch_file() {
+    let root = fixture();
+    let output = run(&[
+        "freespace",
+        root.to_str().unwrap(),
+        "--size",
+        "3",
+        "--force-fs",
+        "--disable-swap-for-wipe",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_dotdot_path_is_rejected_without_touching_either_file() {
+    let root = fixture();
+    let destination = root.join("outside");
+    fs::create_dir_all(destination.join("inner")).unwrap();
+    fs::write(root.join("keep"), b"lexical").unwrap();
+    fs::write(destination.join("keep"), b"resolved").unwrap();
+    std::os::unix::fs::symlink(destination.join("inner"), root.join("link")).unwrap();
+    let input = root.join("link/../keep");
+    let output = run(&["--json", input.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(fs::read(root.join("keep")).unwrap(), b"lexical");
+    assert_eq!(fs::read(destination.join("keep")).unwrap(), b"resolved");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn subcommand_name_after_target_is_rejected_not_treated_as_target() {
+    let root = fixture();
+    let target = root.join("check");
+    fs::write(&target, b"keep").unwrap();
+    let output = run(&["--dry-run", target.to_str().unwrap(), "check"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn freespace_failure_removes_its_scratch_file() {
+    let root = fixture();
+    let output = run(&[
+        "freespace",
+        root.to_str().unwrap(),
+        "--size",
+        "4096",
+        "--json",
+    ]);
+    // Whether the wipe is refused (unprivileged busy-probe) or succeeds, the
+    // zero-filled scratch file must not stay in the user's directory.
+    let _ = output.status.code();
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    fs::remove_dir_all(root).unwrap();
 }

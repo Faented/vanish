@@ -48,7 +48,10 @@ pub fn iterate_chunks(offset: u64, len: u64, chunk: u64) -> impl Iterator<Item =
             return None;
         }
         let n = chunk.min(offset + len - cur);
-        let c = Chunks { offset: cur, len: n };
+        let c = Chunks {
+            offset: cur,
+            len: n,
+        };
         cur += n;
         Some(c)
     })

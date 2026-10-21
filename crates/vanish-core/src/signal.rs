@@ -1,5 +1,6 @@
 //! Один флаг SIGINT/SIGTERM: конвейер доводит текущий файл до конца
-//! (fsync → truncate → unlink) и выходит — по Security Invariant 4.
+//! (все экстенты и проходы → fsync → verify → truncate → sync → unlink)
+//! и не начинает следующие файлы, каталоги или recovery-цели.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

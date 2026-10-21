@@ -4,7 +4,7 @@
 # Результат:       dist/vanish + dist/SHA256SUMS
 #
 # Порядок (важен):
-#   1) cargo build --release
+#   1) cargo test --workspace --release --locked; cargo build --release --locked
 #   2) upx --best --lzma  (если установлен; иначе шаг пропускается с примечанием)
 #   3) SHA-256 финального (уже упакованного) бинаря -> dist/SHA256SUMS
 #      Манифест считается ПОСЛЕ упаковки, иначе --selfcheck упадёт.
@@ -17,8 +17,10 @@ cd "$ROOT"
 DIST="$ROOT/dist"
 BIN_SRC="$ROOT/target/release/vanish"
 
-echo "[build] cargo build --release…"
-cargo build --release
+echo "[build] cargo test --workspace --release --locked…"
+cargo test --workspace --release --locked
+echo "[build] cargo build --release --locked…"
+cargo build --release --locked
 
 [ -x "$BIN_SRC" ] || { echo "[build] ОШИБКА: не найден $BIN_SRC"; exit 4; }
 
@@ -26,7 +28,7 @@ mkdir -p "$DIST"
 cp -f "$BIN_SRC" "$DIST/vanish"
 chmod +x "$DIST/vanish"
 
-# 2) упаковщик («криптор» по-минимальному: сжатие секций + шифрование заголовка).
+# 2) UPX только сжимает бинарь: это не шифрование и не подпись поставки.
 #    Не обязателен: без него манифест честно описывает обычный бинарь.
 if command -v upx >/dev/null 2>&1; then
   echo "[build] упаковка upx --best --lzma…"

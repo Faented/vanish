@@ -1,6 +1,6 @@
 [package]
 name = "backend-linux"
-description = "vanish: Linux backend (O_DIRECT, FIEMAP, PUNCH_HOLE, FITRIM, BLKDISCARD)"
+description = "vanish: Linux backend (O_DIRECT, FIEMAP, PUNCH_HOLE, FITRIM)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,6 @@ license.workspace = true
 [dependencies]
 vanish-core = { workspace = true }
 libc = { workspace = true }
-thiserror = { workspace = true }
 
 [lib]
 name = "backend_linux"
