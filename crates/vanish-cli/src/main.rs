@@ -1,16 +1,19 @@
 //! vanish CLI: разбор аргументов, диспетчеризация, коды выхода.
 
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use vanish_core::config::{Options, PatternChoice};
-use vanish_core::platform::Platform;
-use vanish_core::report::RunReport;
+use vanish_core::error::VanishError;
+use vanish_core::platform::{Platform, Target};
+use vanish_core::report::{RunReport, TargetEvent};
 
 #[cfg(target_os = "linux")]
 use backend_linux as be;
@@ -29,55 +32,61 @@ use backend_windows as be;
 )]
 struct Cli {
     /// цели (файлы или папки)
-    #[arg(trailing_var_arg = true)]
+    #[arg(value_name = "TARGET", num_args = 0..)]
     targets: Vec<PathBuf>,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
 
     /// число проходов записи (по умолчанию 1)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, global = true, default_value_t = 1)]
     passes: u8,
-
-    /// лекоторые рattern: random|zero|gutmann|hex:XX
-    #[arg(long)]
+    /// pattern: random|zero|gutmann|hex:XX
+    #[arg(long, global = true)]
     pattern: Option<String>,
-
-    #[arg(long)]
+    #[arg(long, global = true)]
     verify: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     dry_run: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_rename: bool,
-    #[arg(long)]
-    no_trim: bool, // выключить per-file deallocate
-    #[arg(long)] // FITRIM точки монтирования
+    #[arg(long, global = true)]
+    no_trim: bool,
+    #[arg(long, global = true)]
     trim: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     report: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     accept_cow: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_preserve_root: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     keep_streams: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     force_fs: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     wipe_all_hardlinks: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     disable_swap_for_wipe: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     xdev: bool,
-    #[arg(long)]
-    yes: bool,                 // для device-режима: авто-yes
-    #[arg(long)]
-    recovery_scan: bool, // альтернатива subcommand
+    #[arg(long, global = true)]
+    yes: bool,
+    #[arg(long, global = true)]
+    recovery_scan: bool,
+    /// freespace limit in bytes (default: 95% of available space)
+    #[arg(long, global = true)]
+    size: Option<u64>,
     /// самоверификация бинаря: SHA-256 текущего exe против манифеста SHA256SUMS
-    /// (поиск: аргумент → env VANISH_SHA256SUMS → рядом с exe).
-    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "MANIFEST")]
+    #[arg(
+        long,
+        global = true,
+        num_args = 0..=1,
+        default_missing_value = "",
+        value_name = "MANIFEST"
+    )]
     selfcheck: Option<String>,
 }
 
@@ -86,23 +95,16 @@ enum Cmd {
     /// диагностика пути (read-only)
     Check {
         /// пути для анализа
-        #[arg(trailing_var_arg = true)]
+        #[arg(value_name = "PATH", num_args = 0..)]
         paths: Vec<PathBuf>,
     },
     /// затирание свободного места в каталоге
-    Freespace {
-        dir: PathBuf,
-        /// лимит байтов (иначе — вся доступность-0.5%)
-        #[arg(long)]
-        size: Option<u64>,
-    },
-    /// wipe блочного устройства (корень/Sanitize)
-    Device {
-        dev: PathBuf,
-    },
+    Freespace { dir: PathBuf },
+    /// wipe блочного устройства (временно отключено; устройство не открывается)
+    Device { dev: PathBuf },
     /// дожимание хвостов .vanish-v1-*
     Recovery {
-        #[arg(trailing_var_arg = true)]
+        #[arg(value_name = "ROOT", num_args = 0..)]
         roots: Vec<PathBuf>,
     },
 }
@@ -110,15 +112,11 @@ enum Cmd {
 impl Cli {
     fn opts(&self) -> Result<Options, String> {
         let pattern = match self.pattern.as_deref() {
-            None => PatternChoice::Random,
-            Some("random") => PatternChoice::Random,
+            None | Some("random") => PatternChoice::Random,
             Some("zero") => PatternChoice::Zero,
             Some("gutmann") => PatternChoice::Gutmann,
             Some(s) if s.starts_with("hex:") => {
                 let v = u8::from_str_radix(&s[4..], 16).map_err(|_| "hex:X — неверный байт")?;
-                if self.passes > 1 || s.len() != 6 {
-                    // hex:xx одна с 1 проходом
-                }
                 PatternChoice::Hex(v)
             }
             Some(other) => return Err(format!("неизвестный pattern: {}", other)),
@@ -128,7 +126,7 @@ impl Cli {
             return Err("--passes должен быть >= 1".into());
         }
         if matches!(pattern, PatternChoice::Hex(_)) && passes > 16 {
-            passes = 16; // sane cap
+            passes = 16;
         }
         Ok(Options {
             passes,
@@ -152,353 +150,685 @@ impl Cli {
     }
 }
 
+struct ReportSink {
+    file: File,
+}
+
+struct PreparedTarget {
+    path: PathBuf,
+    canonical: PathBuf,
+}
+
+fn absolute_normalized(path: &Path) -> io::Result<PathBuf> {
+    let raw = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut result = PathBuf::new();
+    for component in raw.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    Ok(result)
+}
+
+fn has_symlink_component(path: &Path) -> io::Result<bool> {
+    let absolute = absolute_normalized(path)?;
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        if let Ok(md) = std::fs::symlink_metadata(&current) {
+            if md.file_type().is_symlink() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Open the report before anything that can remove or overwrite a user target.
+/// `inside_targets` is used for modes which delete descendants of their roots.
+fn prepare_report(
+    path: Option<&Path>,
+    targets: &[PathBuf],
+    inside_targets: bool,
+) -> Result<Option<ReportSink>, String> {
+    let Some(path) = path else { return Ok(None) };
+    let absolute = absolute_normalized(path).map_err(|_| "invalid report path")?;
+    if has_symlink_component(&absolute).map_err(|_| "invalid report path")? {
+        return Err("report path contains a symlink".into());
+    }
+    match std::fs::symlink_metadata(&absolute) {
+        Ok(_) => return Err("report path must be a new file".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err("cannot inspect report path".into()),
+    }
+    let parent = absolute.parent().ok_or("invalid report path")?;
+    if !parent.is_dir() {
+        return Err("report parent is not a directory".into());
+    }
+    let parent = std::fs::canonicalize(parent).map_err(|_| "cannot resolve report parent")?;
+    let report_canon = parent.join(absolute.file_name().ok_or("invalid report path")?);
+
+    for target in targets {
+        let target_abs = absolute_normalized(target).map_err(|_| "invalid target path")?;
+        if target_abs == absolute {
+            return Err("report path is also a target".into());
+        }
+        match std::fs::symlink_metadata(target) {
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        let target_canon = match std::fs::canonicalize(target) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if inside_targets && report_canon.starts_with(&target_canon) {
+            return Err("report path is inside a deleted target".into());
+        }
+    }
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&absolute)
+        .map_err(|_| "cannot create report file")?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| "cannot secure report file")?;
+    Ok(Some(ReportSink { file }))
+}
+
+fn write_serialized<T: Serialize>(sink: &mut ReportSink, value: &T) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    sink.file.set_len(0)?;
+    sink.file.write_all(&bytes)?;
+    sink.file.write_all(b"\n")?;
+    sink.file.flush()?;
+    sink.file.sync_all()
+}
+
 fn safety_refuse(path: &Path, o: &Options) -> Option<&'static str> {
-    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canon = std::fs::canonicalize(path).ok()?;
     let s = canon.to_string_lossy();
     if s == "/" && !o.no_preserve_root {
-        return Some("/")
+        return Some("preserve_root");
     }
     if !o.force_fs {
         for bad in ["/proc", "/sys", "/dev", "/run"] {
-            if s.starts_with(bad) {
-                return Some(bad);
+            if s == bad || s.starts_with(&format!("{bad}/")) {
+                return Some("protected filesystem");
             }
         }
     }
     None
 }
 
-fn make_platform() -> std::boxed::Box<dyn Platform> {
+#[cfg(unix)]
+fn hardlink_refused(md: &std::fs::Metadata, opts: &Options) -> bool {
+    md.nlink() > 1 && !opts.wipe_all_hardlinks
+}
+
+#[cfg(not(unix))]
+fn hardlink_refused(_md: &std::fs::Metadata, _opts: &Options) -> bool {
+    false
+}
+
+fn make_platform() -> Box<dyn Platform> {
     be::platform()
 }
 
 fn compute_exit(report: &RunReport) -> u8 {
-    if report.targets.is_empty() {
-        return 0;
-    }
-    let failed = report.failed;
-    let rejected = report.rejected;
-    let ok = report.ok;
-    if failed > 0 {
+    let interrupted = report.targets.iter().any(|event| {
+        event.status == "skipped"
+            && event
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("SIGINT") || reason.contains("SIGTERM"))
+    });
+    if report.failed > 0 {
         4
-    } else if rejected > 0 && ok > 0 {
-        1
-    } else if rejected > 0 && ok == 0 {
+    } else if report.rejected > 0 && report.ok == 0 && !interrupted {
         3
-    } else {
+    } else if report.ok > 0 && report.rejected == 0 && !interrupted {
         0
+    } else if report.rejected == 0 && !interrupted {
+        // A dry-run is intentionally represented by skipped events. Planning
+        // without touching anything is a successful operation, not partial.
+        0
+    } else if report.targets.is_empty() && !interrupted {
+        0
+    } else {
+        1
     }
 }
 
-fn emit(report: &RunReport, cli: &Cli) {
+fn emit(report: &RunReport, cli: &Cli, mut sink: Option<ReportSink>) -> bool {
+    let mut success = true;
     if cli.json {
-        let mut out = std::io::stdout();
-        let _ = serde_json::to_writer_pretty(&mut out, report);
-        let _ = out.write_all(b"\n");
-    } else {
-        for t in &report.targets {
-            println!(
-                "[{}] {} kind={} {} bytes={} {:?}",
-                t.status,
-                t.kind.as_ref() as &str,
-                t.kind,
-                t.name_hash.get(0..12).unwrap_or("?"),
-                t.bytes,
-                t.reason
-            );
+        let mut out = io::stdout().lock();
+        if serde_json::to_writer_pretty(&mut out, report).is_err() || out.write_all(b"\n").is_err()
+        {
+            success = false;
         }
-        if let Some(f) = &cli.report {
-            if let Ok(text) = serde_json::to_string_pretty(report) {
-                let _ = std::fs::write(f, text);
+    } else {
+        let mut out = io::stdout().lock();
+        for target in &report.targets {
+            if writeln!(
+                out,
+                "[{}] {} {} bytes={} {:?}",
+                target.status,
+                target.kind,
+                target.name_hash.get(0..12).unwrap_or("?"),
+                target.bytes,
+                target.reason
+            )
+            .is_err()
+            {
+                success = false;
+                break;
             }
         }
         eprintln!("{}", report.summary_text());
-        for n in &report.notes {
-            eprintln!("note: {}", n);
+        for note in &report.notes {
+            eprintln!("note: {}", note);
         }
+    }
+    if let Some(ref mut sink) = sink {
+        if write_serialized(sink, report).is_err() {
+            eprintln!("report output failed");
+            success = false;
+        }
+    }
+    success
+}
+
+fn finish_run(report: RunReport, code: u8, cli: &Cli, sink: Option<ReportSink>) -> u8 {
+    let finished = report.finish(code);
+    if emit(&finished, cli, sink) {
+        code
+    } else {
+        4
     }
 }
 
-fn wipe_mode(cli: &Cli, opts: &Options, plat: Option<std::boxed::Box<dyn Platform>>) -> u8 {
-    let plat = plat.unwrap_or_else(make_platform);
-    let mut report = RunReport::new();
-    vanish_core::signal::install();
-    for p in &cli.targets {
-        if let Some(bad) = safety_refuse(p, opts) {
-            report.note(format!("refused: {} — {}", vanish_core::util::name_sha256(p), bad));
-            continue;
-        }
-        let canon = std::fs::canonicalize(p);
-        let target = match canon {
-            Ok(c) => c,
-            Err(e) => {
-                report.note(format!(
-                    "missing {} ({}): пропущен",
-                    vanish_core::util::name_sha256(p),
-                    e
-                ));
-                continue;
-            }
-        };
-        {
-            let mut pipe = vanish_core::pipeline::Pipeline::new(plat.as_ref(), opts, &mut report);
-            pipe.wipe_any(&target);
-        }
-    }
-    let code = compute_exit(&report);
-    let fin = report.finish(code);
-    emit(&fin, cli);
-    code
+fn record_rejection(report: &mut RunReport, kind: &str, path: &Path, detail: &'static str) {
+    report.push(TargetEvent {
+        kind: kind.into(),
+        name_hash: vanish_core::util::name_sha256(path),
+        tail: None,
+        strategy: None,
+        status: "rejected".into(),
+        reason: Some(detail.into()),
+        bytes: 0,
+        warnings: vec![],
+        guarantees: None,
+        elapsed_ms: 0,
+    });
 }
 
-fn check_mode(paths: &[PathBuf], cli: &Cli) -> u8 {
-    let plat = make_platform();
-    let rep = match vanish_core::check::run(plat.as_ref(), paths) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("check не удался: {}", e);
+fn wipe_mode(cli: &Cli, opts: &Options, plat: Option<Box<dyn Platform>>) -> u8 {
+    let sink = match prepare_report(cli.report.as_deref(), &cli.targets, !opts.dry_run) {
+        Ok(sink) => sink,
+        Err(_) => {
+            eprintln!("report setup failed");
             return 4;
         }
     };
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
-    } else {
-        eprintln!("backend: {}", rep.backend);
-        for e in &rep.entries {
-            eprintln!(
-                "hash={:012}… exists={} kind={} nlink={:?} verdict={}",
-                e.name_hash,
-                e.exists,
-                e.kind,
-                e.nlink,
-                e.verdict
-            );
-            if !e.openers.is_empty() {
-                eprintln!("  openers: {:?}", e.openers);
+    let plat = plat.unwrap_or_else(make_platform);
+    let mut report = RunReport::new();
+    vanish_core::signal::install();
+
+    // Resolve and validate every top-level target before starting any deletion.
+    // This prevents an input such as `dir child` from deleting `dir` and only
+    // then discovering that `child` was an alias/nested target.
+    let mut candidates = Vec::<Option<PreparedTarget>>::new();
+    for path in &cli.targets {
+        let md = match std::fs::symlink_metadata(path) {
+            Ok(md) => md,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                record_rejection(&mut report, "file", path, "missing target");
+                candidates.push(None);
+                continue;
             }
+            Err(error) => {
+                let error: VanishError = error.into();
+                let mut pipe =
+                    vanish_core::pipeline::Pipeline::new(plat.as_ref(), opts, &mut report);
+                pipe.record_error("file", path, &error);
+                candidates.push(None);
+                continue;
+            }
+        };
+        if md.file_type().is_symlink() {
+            record_rejection(&mut report, "file", path, "symlink target");
+            candidates.push(None);
+            continue;
         }
-        for s in &rep.swap {
-            eprintln!("swap: {} {} МБ", s.path, s.size / 1024 / 1024);
+        if has_symlink_component(path).unwrap_or(true) {
+            record_rejection(&mut report, "file", path, "symlink path component");
+            candidates.push(None);
+            continue;
+        }
+        if !md.is_file() && !md.is_dir() {
+            record_rejection(&mut report, "file", path, "special target");
+            candidates.push(None);
+            continue;
+        }
+        if md.is_file() && hardlink_refused(&md, opts) {
+            record_rejection(&mut report, "file", path, "hard-linked target");
+            candidates.push(None);
+            continue;
+        }
+        if let Some(reason) = safety_refuse(path, opts) {
+            record_rejection(
+                &mut report,
+                if md.is_dir() { "dir" } else { "file" },
+                path,
+                reason,
+            );
+            candidates.push(None);
+            continue;
+        }
+        let canonical = match std::fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                record_rejection(&mut report, "file", path, "unresolvable target");
+                candidates.push(None);
+                continue;
+            }
+        };
+        if candidates
+            .iter()
+            .flatten()
+            .any(|candidate| candidate.canonical == canonical)
+        {
+            record_rejection(
+                &mut report,
+                if md.is_dir() { "dir" } else { "file" },
+                path,
+                "alias target",
+            );
+            candidates.push(None);
+            continue;
+        }
+        candidates.push(Some(PreparedTarget {
+            path: path.clone(),
+            canonical,
+        }));
+    }
+
+    // A parent target owns all descendants. Reject descendants rather than
+    // allowing input order to decide which path is removed first.
+    let overlapping: Vec<bool> = candidates
+        .iter()
+        .map(|candidate| {
+            candidate.as_ref().is_some_and(|candidate| {
+                candidates.iter().any(|other| {
+                    other.as_ref().is_some_and(|other| {
+                        candidate.canonical != other.canonical
+                            && (other.canonical.starts_with(&candidate.canonical)
+                                || candidate.canonical.starts_with(&other.canonical))
+                    })
+                })
+            })
+        })
+        .collect();
+    for index in 0..candidates.len() {
+        let Some(candidate) = candidates[index].as_ref() else {
+            continue;
+        };
+        if overlapping[index] {
+            let path = candidate.path.clone();
+            candidates[index] = None;
+            record_rejection(&mut report, "dir", &path, "overlapping targets rejected");
         }
     }
-    0
+
+    for candidate in candidates.into_iter().flatten() {
+        if vanish_core::signal::shutdown_requested() {
+            let mut pipe = vanish_core::pipeline::Pipeline::new(plat.as_ref(), opts, &mut report);
+            pipe.wipe_any(&candidate.path);
+            continue;
+        }
+        let mut pipe = vanish_core::pipeline::Pipeline::new(plat.as_ref(), opts, &mut report);
+        pipe.wipe_any(&candidate.path);
+    }
+    let code = compute_exit(&report);
+    finish_run(report, code, cli, sink)
 }
 
-fn freespace_mode(dir: PathBuf, size: Option<u64>, cli: &Cli, opts: &mut Options) -> u8 {
-    #[cfg(target_os = "linux")]
+fn check_mode(paths: &[PathBuf], cli: &Cli) -> u8 {
+    let sink = match prepare_report(cli.report.as_deref(), paths, false) {
+        Ok(sink) => sink,
+        Err(_) => {
+            eprintln!("report setup failed");
+            return 4;
+        }
+    };
+    let plat = make_platform();
+    let rep = match vanish_core::check::run(plat.as_ref(), paths) {
+        Ok(report) => report,
+        Err(_) => {
+            eprintln!("check failed");
+            return 4;
+        }
+    };
+    let mut success = true;
+    if cli.json {
+        let mut out = io::stdout().lock();
+        success =
+            serde_json::to_writer_pretty(&mut out, &rep).is_ok() && out.write_all(b"\n").is_ok();
+    } else {
+        eprintln!("backend: {}", rep.backend);
+        for entry in &rep.entries {
+            eprintln!(
+                "hash={:012}… exists={} kind={} nlink={:?} verdict={}",
+                entry.name_hash, entry.exists, entry.kind, entry.nlink, entry.verdict
+            );
+            if !entry.openers.is_empty() {
+                eprintln!("  openers: {:?}", entry.openers);
+            }
+        }
+        for swap in &rep.swap {
+            eprintln!("swap: {} {} MiB", swap.path, swap.size / 1024 / 1024);
+        }
+    }
+    if let Some(mut sink) = sink {
+        if write_serialized(&mut sink, &rep).is_err() {
+            eprintln!("report output failed");
+            success = false;
+        }
+    }
+    if success {
+        0
+    } else {
+        4
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
+    vanish_core::signal::install();
+    let sink = match prepare_report(cli.report.as_deref(), std::slice::from_ref(&dir), false) {
+        Ok(sink) => sink,
+        Err(_) => {
+            eprintln!("report setup failed");
+            return 4;
+        }
+    };
+    let mut report = RunReport::new();
+    let avail = match be::avail_bytes(&dir) {
+        Ok(available) => available,
+        Err(error) => {
+            let error: VanishError = error.into();
+            let platform = make_platform();
+            let mut pipe =
+                vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+            pipe.record_error("freespace", &dir, &error);
+            let code = compute_exit(&report);
+            return finish_run(report, code, cli, sink);
+        }
+    };
+    let budget = cli.size.unwrap_or_else(|| avail.saturating_mul(95) / 100);
+    if opts.dry_run {
+        report.push(TargetEvent {
+            kind: "freespace".into(),
+            name_hash: vanish_core::util::name_sha256(&dir),
+            tail: None,
+            strategy: Some("planned".into()),
+            status: "skipped".into(),
+            reason: Some("dry-run: no file created or written".into()),
+            bytes: 0,
+            warnings: vec![],
+            guarantees: None,
+            elapsed_ms: 0,
+        });
+        return finish_run(report, 0, cli, sink);
+    }
+
+    eprintln!(
+        "freespace: budget {} MiB (available {} MiB)",
+        budget / 1024 / 1024,
+        avail / 1024 / 1024
+    );
+    let path = dir.join(format!(".{}", vanish_core::util::random_tail()));
+    let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            let error: VanishError = error.into();
+            let platform = make_platform();
+            let mut pipe =
+                vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+            pipe.record_error("freespace", &dir, &error);
+            let code = compute_exit(&report);
+            return finish_run(report, code, cli, sink);
+        }
+    };
+    let zero = vec![0u8; 1024 * 1024];
+    let mut written = 0u64;
+    let mut write_error = None;
+    let mut file = Some(file);
     {
-        use std::io::Write;
-        let avail = match be::avail_bytes(&dir) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("нет statvfs на dir");
-                return 4;
-            }
-        };
-        let budget = size.unwrap_or(avail * 95 / 100);
-        eprintln!("freespace: бюджет {} МБ (из доступных {})", budget / 1024 / 1024, avail / 1024 / 1024);
-        let tail = format!(".{}", vanish_core::util::random_tail());
-        let path = dir.join(tail);
-        let file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("freespace file create: {}", e);
-                return 4;
-            }
-        };
-        let mut w = std::io::BufWriter::with_capacity(1024 * 1024, file);
-        let zero = vec![0u8; 1024 * 1024];
-        let mut written: u64 = 0;
+        let mut writer = io::BufWriter::with_capacity(1024 * 1024, file.take().unwrap());
         while written < budget {
-            match w.write_all(&zero) {
-                Ok(_) => {
-                    written += zero.len() as u64;
-                    if written % (256 * 1024 * 1024) == 0 {
-                        let _ = w.flush();
-                    }
-                }
-                Err(e) => {
-                    // ENOSPC ожидаем на финале
-                    if e.kind() != std::io::ErrorKind::StorageFull {
-                        let raw = e.raw_os_error().unwrap_or(0);
-                        if raw != ENOSPC {
-                            eprintln!("freespace write: {} (после {} байт)", e, written);
-                            // файл остаётся как хвост —демьз recovery
-                            break;
-                        }
-                    }
-                    break;
+            let amount = std::cmp::min((budget - written) as usize, zero.len());
+            if let Err(error) = writer.write_all(&zero[..amount]) {
+                write_error = Some(error);
+                break;
+            }
+            written += amount as u64;
+        }
+        if let Err(error) = writer.flush() {
+            if write_error.is_none() {
+                write_error = Some(error);
+            }
+        }
+        match writer.into_inner() {
+            Ok(inner) => file = Some(inner),
+            Err(error) => {
+                if write_error.is_none() {
+                    write_error = Some(error.into_error());
                 }
             }
         }
-        let _ = w.flush();
-        if let Ok(f) = w.get_mut().sync_all() {
-            let _ = f;
-        }
-        drop(w);
-        // данные затёрты в файле — обрабатываем через общий конвейер (tail-name задан).
-        let md = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => return 4,
-        };
-        let mut report = RunReport::new();
-        let mut details = vanish_core::util::name_sha256(&path);
-        let _ = &mut details;
-        let target = vanish_core::platform::Target::from_parts(
-            path,
-            md.dev(),
-            md.ino(),
-            md.len(),
-            md.nlink() as u32,
-        );
-        let plat = make_platform();
-        {
-            let mut pipe = vanish_core::pipeline::Pipeline::new(plat.as_ref(), opts, &mut report);
-            if let Err(e) = pipe.wipe_target(target, false) {
-                eprintln!("freespace pipeline: {}", e);
+    }
+    if let Some(file) = file {
+        if let Err(error) = file.sync_all() {
+            if write_error.is_none() {
+                write_error = Some(error);
             }
         }
-        let code = compute_exit(&report);
-        let fin = report.finish(code);
-        emit(&fin, cli);
-        code
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (dir, size, cli, opts);
-        eprintln!("freespace: только Linux в v0.1");
-        3
+
+    if let Some(error) = write_error {
+        if let Ok(md) = std::fs::symlink_metadata(&path) {
+            let target = Target::from_parts(
+                path.clone(),
+                md.dev(),
+                md.ino(),
+                md.len(),
+                md.nlink() as u32,
+            );
+            let platform = make_platform();
+            let mut pipe =
+                vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+            if let Err(cleanup) = pipe.wipe_target(target, false) {
+                pipe.record_error("file", &path, &cleanup);
+            }
+        }
+        let error = VanishError::Io(error);
+        let platform = make_platform();
+        let mut pipe = vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+        pipe.record_error("freespace", &dir, &error);
+    } else {
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) => {
+                let target = Target::from_parts(
+                    path.clone(),
+                    md.dev(),
+                    md.ino(),
+                    md.len(),
+                    md.nlink() as u32,
+                );
+                let platform = make_platform();
+                let mut pipe =
+                    vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+                if let Err(error) = pipe.wipe_target(target, false) {
+                    pipe.record_error("file", &path, &error);
+                }
+            }
+            Err(error) => {
+                let error: VanishError = error.into();
+                let platform = make_platform();
+                let mut pipe =
+                    vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+                pipe.record_error("freespace", &dir, &error);
+            }
+        }
     }
+    let code = compute_exit(&report);
+    finish_run(report, code, cli, sink)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
+    vanish_core::signal::install();
+    let sink = match prepare_report(cli.report.as_deref(), std::slice::from_ref(&dir), false) {
+        Ok(sink) => sink,
+        Err(_) => {
+            eprintln!("report setup failed");
+            return 4;
+        }
+    };
+    let mut report = RunReport::new();
+    record_rejection(&mut report, "freespace", &dir, "unsupported platform");
+    finish_run(report, 3, cli, sink)
 }
 
 fn device_mode(dev: PathBuf, cli: &Cli) -> u8 {
-    #[cfg(target_os = "linux")]
+    // Device execution is deliberately disabled. In particular, this branch does
+    // not stat, open, ioctl, mount-check, or prompt for the supplied device.
+    if cli
+        .report
+        .as_deref()
+        .is_some_and(|report| absolute_normalized(report).ok() == absolute_normalized(&dev).ok())
     {
-        if !cli.yes {
-            eprint!(
-                "ВАРНИНГ: FORMAT/WIPE устройства {} — данные НЕ ВОССТАНОВИМЫ. Наберите yes для продолжения: ",
-                dev.display()
-            );
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
-            if line.trim() != "yes" {
-                eprintln!("отказ; отменено пользователем");
-                return 0;
-            }
-        }
-        if be::is_mounted_device(&dev) {
-            eprintln!("устройство смонтировано — откажусь; (размонтируйте)");
-            return 3;
-        }
-        let plat = make_platform();
-        for s in plat.swap_active().unwrap_or_default() {
-            if s.path == dev.display().to_string() {
-                eprintln!("устройство активно в swap — откажусь");
-                return 3;
-            }
-        }
-        match be::device_wipe(&dev) {
-            Ok(r) => {
-                eprintln!(
-                    "device {}: {} МБ method={} physically_guaranteed={}",
-                    r.path,
-                    r.size / 1024 / 1024,
-                    r.method,
-                    r.physical_guaranteed
-                );
-                if !r.physical_guaranteed {
-                    eprintln!(
-                        "WARNING: BLKDISCARD — LOGICAL deallocation (TRIM); физическое стирание НЕ ГАРАНТИРОВАНО."
-                    );
-                    eprintln!("Рекомендация: сначала cryptsetup luksErase ключа, затем NVMe/ATA Secure Erase, затемшифровать заново.");
-                }
-                0
-            }
-            Err(e) => {
-                eprintln!("device wipe: {} (нужен root?)", e);
-                4
-            }
-        }
+        eprintln!("report setup failed");
+        return 4;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (dev, cli);
-        eprintln!("device: только Linux в v0.1");
-        3
-    }
+    let sink = match prepare_report(cli.report.as_deref(), &[], false) {
+        Ok(sink) => sink,
+        Err(_) => {
+            eprintln!("report setup failed");
+            return 4;
+        }
+    };
+    let mut report = RunReport::new();
+    report.push(TargetEvent {
+        kind: "device".into(),
+        name_hash: vanish_core::util::name_sha256(&dev),
+        tail: None,
+        strategy: Some("disabled".into()),
+        status: "rejected".into(),
+        reason: Some(if cli.dry_run {
+            "dry-run: device execution disabled; no device access performed".into()
+        } else {
+            "device execution disabled; no device access performed".into()
+        }),
+        bytes: 0,
+        warnings: vec![],
+        guarantees: None,
+        elapsed_ms: 0,
+    });
+    finish_run(report, 3, cli, sink)
 }
 
-fn recovery_mode(roots: Vec<PathBuf>, cli: &Cli, opts: &mut Options) -> u8 {
-    let plat = make_platform();
-    let roots: Vec<PathBuf> = if roots.is_empty() {
+fn recovery_mode(roots: Vec<PathBuf>, cli: &Cli, opts: &Options) -> u8 {
+    vanish_core::signal::install();
+    let roots = if roots.is_empty() {
         vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
     } else {
         roots
     };
+    let sink = match prepare_report(cli.report.as_deref(), &roots, !opts.dry_run) {
+        Ok(sink) => sink,
+        Err(_) => {
+            eprintln!("report setup failed");
+            return 4;
+        }
+    };
+    let platform = make_platform();
     let mut report = RunReport::new();
-    match vanish_core::recovery::run(plat.as_ref(), &roots, opts, &mut report) {
-        Ok(n) => report.note(format!("найдено хвостов-файлов: {}", n)),
-        Err(e) => {
-            eprintln!("recovery: {}", e);
+    let mut valid_roots = Vec::new();
+    for root in roots {
+        match std::fs::symlink_metadata(&root) {
+            Ok(md) if md.file_type().is_symlink() => {
+                let error = VanishError::UnsafePath("symlink root".into());
+                let mut pipe =
+                    vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+                pipe.record_error("tail", &root, &error);
+            }
+            Ok(_) if safety_refuse(&root, opts).is_some() => {
+                let error = VanishError::UnsafePath("protected root".into());
+                let mut pipe =
+                    vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+                pipe.record_error("tail", &root, &error);
+            }
+            Ok(_) | Err(_) => valid_roots.push(root),
         }
     }
-    match vanish_core::recovery::run_dirs(plat.as_ref(), &roots, opts, &mut report) {
-        Ok(n) => report.note(format!("убрано пустых хвостов-каталогов: {}", n)),
-        Err(e) => {
-            eprintln!("recovery(директории): {}", e);
+    if !valid_roots.is_empty() {
+        if vanish_core::recovery::run(platform.as_ref(), &valid_roots, opts, &mut report).is_err() {
+            report.note("recovery file scan failed");
+        }
+        if vanish_core::recovery::run_dirs(platform.as_ref(), &valid_roots, opts, &mut report)
+            .is_err()
+        {
+            report.note("recovery directory scan failed");
         }
     }
     let code = compute_exit(&report);
-    let fin = report.finish(code);
-    emit(&fin, cli);
-    code
+    finish_run(report, code, cli, sink)
 }
 
-const ENOSPC: i32 = 28; // linux errno: no space left on device
-
-/// Коды выхода selfcheck: 0=verified, 1=TAMPERED (хэш не совпал),
-/// 2=манифест не найден, 4=ошибка выполнения проверки.
+/// Коды выхода selfcheck: 0=verified, 1=TAMPERED, 2=manifest missing, 4=error.
 fn selfcheck_mode(manifest_arg: Option<&str>) -> u8 {
     let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("selfcheck: не могу определить путь бинаря: {}", e);
+        Ok(exe) => exe,
+        Err(_) => {
+            eprintln!("selfcheck: cannot determine executable");
             return 4;
         }
     };
     let explicit = match manifest_arg {
         Some("") | None => None,
-        Some(p) => Some(Path::new(p)),
+        Some(path) => Some(Path::new(path)),
     };
-    let man = match vanish_core::selfcheck::resolve_manifest(&exe, explicit) {
-        Some(p) => p,
+    let manifest = match vanish_core::selfcheck::resolve_manifest(&exe, explicit) {
+        Some(path) => path,
         None => {
-            eprintln!(
-                "selfcheck: манифест SHA256SUMS не найден. Укажите путь: --selfcheck <SHA256SUMS> (собирается scripts/build-release.sh)"
-            );
+            eprintln!("selfcheck: SHA256SUMS manifest not found");
             return 2;
         }
     };
-    match vanish_core::selfcheck::check(&exe, &man) {
+    match vanish_core::selfcheck::check(&exe, &manifest) {
         Ok(true) => {
-            println!("[ok] selfcheck: SHA-256 бинаря совпадает с манифестом ({})", man.display());
+            println!("[ok] selfcheck: SHA-256 matches manifest");
             0
         }
         Ok(false) => {
-            println!(
-                "[tampered] selfcheck: ХЭШ БИНАРЯ НЕ СОВПАДАЕТ с манифестом ({}) — \
-                 бинарь изменён после сборки; не используйте в защищённых задачах",
-                man.display()
-            );
+            println!("[tampered] selfcheck: SHA-256 does not match manifest");
             1
         }
-        Err(e) => {
-            eprintln!("selfcheck: {}", e);
+        Err(_) => {
+            eprintln!("selfcheck failed");
             4
         }
     }
@@ -506,35 +836,27 @@ fn selfcheck_mode(manifest_arg: Option<&str>) -> u8 {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    // Самоверификация бинаря — до остальной логики.
     if cli.selfcheck.is_some() {
         return ExitCode::from(selfcheck_mode(cli.selfcheck.as_deref()));
     }
-
     let opts = match cli.opts() {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("usage: {}", e);
+        Ok(opts) => opts,
+        Err(error) => {
+            eprintln!("usage: {}", error);
             return ExitCode::from(2);
         }
     };
-    let mut opts = opts;
     let code = match &cli.cmd {
         Some(Cmd::Check { paths }) => check_mode(paths, &cli),
-        Some(Cmd::Freespace { dir, size }) => freespace_mode(dir.clone(), *size, &cli, &mut opts),
+        Some(Cmd::Freespace { dir }) => freespace_mode(dir.clone(), &cli, &opts),
         Some(Cmd::Device { dev }) => device_mode(dev.clone(), &cli),
-        Some(Cmd::Recovery { roots }) => recovery_mode(roots.clone(), &cli, &mut opts),
-        None => {
-            if cli.recovery_scan {
-                recovery_mode(cli.targets.clone(), &cli, &mut opts)
-            } else if cli.targets.is_empty() {
-                eprintln!("vanish: укажите цели (или используйте 'check'/'freespace'/'device'/'recovery-scan')");
-                2
-            } else {
-                wipe_mode(&cli, &opts, None)
-            }
+        Some(Cmd::Recovery { roots }) => recovery_mode(roots.clone(), &cli, &opts),
+        None if cli.recovery_scan => recovery_mode(cli.targets.clone(), &cli, &opts),
+        None if cli.targets.is_empty() => {
+            eprintln!("vanish: specify targets or a subcommand");
+            2
         }
+        None => wipe_mode(&cli, &opts, None),
     };
     ExitCode::from(code)
 }
