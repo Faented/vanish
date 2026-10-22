@@ -95,15 +95,20 @@ fn missing_and_symlink_are_rejected_without_following_link() {
 }
 
 #[test]
-fn device_dry_run_is_disabled_without_touching_supplied_path() {
+fn device_dry_run_preflights_without_touching_supplied_path() {
     let root = fixture();
     let supplied = root.join("not-a-device");
+    fs::write(&supplied, b"keep").unwrap();
     let output = run(&["device", "--dry-run", "--json", supplied.to_str().unwrap()]);
 
     assert_exit(&output, 3);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("device execution disabled"));
-    assert!(!supplied.exists());
+    assert!(
+        stdout.contains("not a block device"),
+        "preflight rejection expected: {stdout}"
+    );
+    assert_eq!(fs::read(&supplied).unwrap(), b"keep");
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -330,5 +335,20 @@ fn freespace_failure_removes_its_scratch_file() {
     // zero-filled scratch file must not stay in the user's directory.
     let _ = output.status.code();
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn check_reports_guarantee_ceiling_without_mutating() {
+    let root = fixture();
+    let target = root.join("check-target");
+    fs::write(&target, b"keep").unwrap();
+    let output = run(&["check", target.to_str().unwrap()]);
+    assert_exit(&output, 0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("guarantee="), "stderr: {stderr}");
+    assert!(stderr.contains("verdict="), "stderr: {stderr}");
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
     fs::remove_dir_all(root).unwrap();
 }

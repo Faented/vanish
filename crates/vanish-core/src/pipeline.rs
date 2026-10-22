@@ -5,16 +5,32 @@
 
 use crate::config::Options;
 use crate::error::{Result, VanishError};
-use crate::fsinfo::VolumeInfo;
+use crate::fsinfo::{JournalState, VolumeInfo};
 use crate::pattern::PatternStream;
 use crate::platform::{Platform, Target};
 use crate::report::{Guarantees, RunReport, TargetEvent, Timer};
 use crate::signal::shutdown_requested;
-use crate::strategy::decide;
+use crate::strategy::{decide, Strategy};
 use crate::util;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
+/// Achieved wipe level for a successfully overwritten file. Journal names are a
+/// separate caveat: with an active journal the level is downgraded to
+/// `content-only` even though the data extents were overwritten.
+fn file_guarantee_level(strategy: Strategy, v: &VolumeInfo) -> &'static str {
+    match strategy {
+        Strategy::RamUnlink | Strategy::CowAccept => "content-only",
+        Strategy::HddOverwrite | Strategy::OverwriteDealloc => {
+            if matches!(v.journal, JournalState::Active | JournalState::Unknown) {
+                "content-only"
+            } else {
+                "G1"
+            }
+        }
+    }
+}
 
 pub struct Pipeline<'a> {
     pub platform: &'a dyn Platform,
@@ -157,6 +173,7 @@ impl<'a> Pipeline<'a> {
                             ),
                             bytes: 0,
                             warnings: vec![],
+                            guarantee_level: "none".into(),
                             guarantees: None,
                             elapsed_ms: 0,
                         };
@@ -238,6 +255,7 @@ impl<'a> Pipeline<'a> {
             reason: None,
             bytes: 0,
             warnings: vec![],
+            guarantee_level: "G0".into(),
             guarantees: Some(self.guarantees(&vinfo)),
             elapsed_ms: timer.ms(),
         };
@@ -379,6 +397,7 @@ impl<'a> Pipeline<'a> {
             reason: None,
             bytes: bytes_wiped,
             warnings,
+            guarantee_level: file_guarantee_level(strategy, &vinfo).into(),
             guarantees: Some(self.guarantees(&vinfo)),
             elapsed_ms: timer.ms(),
         };
@@ -415,6 +434,7 @@ impl<'a> Pipeline<'a> {
             // Nothing was written: planned size is not "bytes overwritten".
             bytes: 0,
             warnings: vec![],
+            guarantee_level: "none".into(),
             guarantees: Some(self.guarantees(&vinfo)),
             elapsed_ms: timer.ms(),
         };
@@ -439,6 +459,7 @@ impl<'a> Pipeline<'a> {
             reason: Some(format!("{}: {}", reason_kind, detail)),
             bytes: 0,
             warnings: vec![],
+            guarantee_level: "none".into(),
             guarantees: None,
             elapsed_ms: timer.ms(),
         };
@@ -462,6 +483,7 @@ impl<'a> Pipeline<'a> {
             reason: Some(format!("{}: {}", reason_kind, detail)),
             bytes: 0,
             warnings: vec![],
+            guarantee_level: "none".into(),
             guarantees: None,
             elapsed_ms: timer.ms(),
         };
@@ -501,6 +523,7 @@ impl<'a> Pipeline<'a> {
             reason: Some(reason.into()),
             bytes: 0,
             warnings: vec![],
+            guarantee_level: "none".into(),
             guarantees: None,
             elapsed_ms: 0,
         });

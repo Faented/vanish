@@ -32,6 +32,10 @@ pub struct TargetEvent {
     pub reason: Option<String>,
     pub bytes: u64,
     pub warnings: Vec<String>,
+    /// Achieved sanitization level for this target: G0 (unlink), G1 (extent
+    /// overwrite), G3 (free-space fill), content-only (deallocation/RAM/COW or
+    /// journal caveat) or none (plan/refusal/failure). Never implies G2/G4/G5.
+    pub guarantee_level: String,
     pub guarantees: Option<Guarantees>,
     pub elapsed_ms: u64,
 }

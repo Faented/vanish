@@ -394,7 +394,7 @@ fn finish_run(report: RunReport, code: u8, cli: &Cli, sink: Option<ReportSink>) 
     }
 }
 
-fn record_rejection(report: &mut RunReport, kind: &str, path: &Path, detail: &'static str) {
+fn record_rejection(report: &mut RunReport, kind: &str, path: &Path, detail: impl Into<String>) {
     report.push(TargetEvent {
         kind: kind.into(),
         name_hash: vanish_core::util::name_sha256(path),
@@ -404,6 +404,7 @@ fn record_rejection(report: &mut RunReport, kind: &str, path: &Path, detail: &'s
         reason: Some(detail.into()),
         bytes: 0,
         warnings: vec![],
+        guarantee_level: "none".into(),
         guarantees: None,
         elapsed_ms: 0,
     });
@@ -564,9 +565,17 @@ fn check_mode(paths: &[PathBuf], cli: &Cli, opts: &Options) -> u8 {
         eprintln!("backend: {}", rep.backend);
         for entry in &rep.entries {
             eprintln!(
-                "hash={:012}… exists={} kind={} nlink={:?} verdict={}",
-                entry.name_hash, entry.exists, entry.kind, entry.nlink, entry.verdict
+                "hash={:012}… exists={} kind={} nlink={:?} guarantee={} verdict={}",
+                entry.name_hash,
+                entry.exists,
+                entry.kind,
+                entry.nlink,
+                entry.guarantee_ceiling,
+                entry.verdict
             );
+            for note in &entry.guarantee_notes {
+                eprintln!("  guarantee-note: {}", note);
+            }
             if !entry.openers.is_empty() {
                 eprintln!("  openers: {:?}", entry.openers);
             }
@@ -642,6 +651,7 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
             reason: Some("dry-run: no file created or written".into()),
             bytes: 0,
             warnings: vec![],
+            guarantee_level: "none".into(),
             guarantees: None,
             elapsed_ms: 0,
         });
@@ -719,6 +729,7 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
                     reason: Some("SIGINT/SIGTERM: freespace остановлен, скретч-файл удалён".into()),
                     bytes: 0,
                     warnings: vec![],
+                    guarantee_level: "none".into(),
                     guarantees: None,
                     elapsed_ms: 0,
                 });
@@ -770,12 +781,35 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
                     md.nlink() as u32,
                 );
                 let platform = make_platform();
-                let mut pipe =
-                    vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
-                if let Err(error) = pipe.wipe_target(target, false) {
-                    pipe.record_error("file", &path, &error);
-                    if let Err(remove) = std::fs::remove_file(&path) {
-                        pipe.record_error("file", &path, &VanishError::Io(remove));
+                let outcome = {
+                    let mut pipe =
+                        vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+                    pipe.wipe_target(target, false)
+                };
+                match outcome {
+                    Ok(()) => {
+                        if let Some(event) = report.targets.last_mut() {
+                            event.kind = "freespace".into();
+                            event.reason = Some("freespace: скретч перезаписан и удалён".into());
+                            let journal = event
+                                .guarantees
+                                .as_ref()
+                                .map(|g| g.journal_contains_old_names)
+                                .unwrap_or(true);
+                            event.guarantee_level =
+                                if journal { "content-only" } else { "G3" }.into();
+                        }
+                    }
+                    Err(error) => {
+                        let mut pipe = vanish_core::pipeline::Pipeline::new(
+                            platform.as_ref(),
+                            opts,
+                            &mut report,
+                        );
+                        pipe.record_error("file", &path, &error);
+                        if let Err(remove) = std::fs::remove_file(&path) {
+                            pipe.record_error("file", &path, &VanishError::Io(remove));
+                        }
                     }
                 }
             }
@@ -826,22 +860,81 @@ fn device_mode(dev: PathBuf, cli: &Cli) -> u8 {
         }
     };
     let mut report = RunReport::new();
-    report.push(TargetEvent {
-        kind: "device".into(),
-        name_hash: vanish_core::util::name_sha256(&dev),
-        tail: None,
-        strategy: Some("disabled".into()),
-        status: "rejected".into(),
-        reason: Some(if cli.dry_run {
-            "dry-run: device execution disabled; no device access performed".into()
-        } else {
-            "device execution disabled; no device access performed".into()
-        }),
-        bytes: 0,
-        warnings: vec![],
-        guarantees: None,
-        elapsed_ms: 0,
-    });
+    if cli.dry_run {
+        // Read-only preflight: metadata, /proc and /sys only. The backend never
+        // opens the block device and execution_allowed is always false.
+        #[cfg(target_os = "linux")]
+        match be::preflight(&dev) {
+            Ok(pf) => {
+                let mut warnings = pf.blockers.clone();
+                if let Some(model) = &pf.model {
+                    warnings.push(format!("model: {model}"));
+                }
+                if !pf.mounts.is_empty() {
+                    warnings.push(format!("mounted_at: {:?}", pf.mounts));
+                }
+                if pf.swap_active {
+                    warnings.push("swap_active".into());
+                }
+                if !pf.holders.is_empty() {
+                    warnings.push(format!("holders: {:?}", pf.holders));
+                }
+                if !pf.slaves.is_empty() {
+                    warnings.push(format!("slaves: {:?}", pf.slaves));
+                }
+                if !pf.boot_related.is_empty() {
+                    warnings.push(format!("boot_related: {:?}", pf.boot_related));
+                }
+                report.note(format!(
+                    "device preflight: {} -> {} ({}:{}) size={} read_only={} rotational={:?} execution_allowed=false",
+                    pf.path.display(),
+                    pf.canonical.display(),
+                    pf.major,
+                    pf.minor,
+                    pf.size_bytes,
+                    pf.read_only,
+                    pf.rotational
+                ));
+                report.push(TargetEvent {
+                    kind: "device".into(),
+                    name_hash: vanish_core::util::name_sha256(&dev),
+                    tail: None,
+                    strategy: Some("disabled".into()),
+                    status: "skipped".into(),
+                    reason: Some(
+                        "dry-run: read-only preflight completed; device execution disabled".into(),
+                    ),
+                    bytes: 0,
+                    warnings,
+                    guarantee_level: "none".into(),
+                    guarantees: None,
+                    elapsed_ms: 0,
+                });
+            }
+            Err(error) => {
+                record_rejection(
+                    &mut report,
+                    "device",
+                    &dev,
+                    format!("dry-run preflight failed (device execution disabled): {error}"),
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        record_rejection(
+            &mut report,
+            "device",
+            &dev,
+            "dry-run: device execution disabled; read-only preflight unsupported on this platform",
+        );
+    } else {
+        record_rejection(
+            &mut report,
+            "device",
+            &dev,
+            "device execution disabled; no device access performed",
+        );
+    }
     finish_run(report, 3, cli, sink)
 }
 
@@ -1006,6 +1099,7 @@ mod tests {
                 reason: reason.map(str::to_string),
                 bytes: 0,
                 warnings: Vec::new(),
+                guarantee_level: "none".into(),
                 guarantees: None,
                 elapsed_ms: 0,
             });

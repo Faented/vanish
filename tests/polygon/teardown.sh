@@ -12,14 +12,9 @@ fi
 load_run
 if [[ -s "$RUN/loop" ]]; then
   check_loop
-  if findmnt --mountpoint "$MNT" >/dev/null; then
-    unmount_owned
-  else
-    [[ $? == 1 ]] || die 'cannot inspect mountpoint'
-    check_unmounted
-  fi
-  check_loop
-  check_unmounted
+  # finalize normally unmounts $MNT, but udisks may have auto-mounted our loop
+  # elsewhere. Unmount only mounts whose backing device is this exact loop.
+  unmount_all_owned
   losetup --detach "$LOOP" || die 'detach failed; image retained'
 fi
 # Never unlink an image still associated with any loop, even after detach.

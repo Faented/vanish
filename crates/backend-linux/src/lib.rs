@@ -1,5 +1,6 @@
 //! backend-linux: реализация контракта vanish-core поверх syscall.
 
+mod preflight;
 mod sys;
 #[cfg(test)]
 mod test_support;
@@ -930,6 +931,8 @@ mod wipe_handle {
 pub use wipe_handle::LinuxWipeHandle;
 
 // ---------- device helpers (vanish device) ----------
+
+pub use preflight::{preflight, DevicePreflight};
 
 pub struct DeviceResult {
     pub path: String,

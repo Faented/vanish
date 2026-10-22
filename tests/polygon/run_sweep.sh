@@ -65,17 +65,35 @@ sync
 check_mounted
 # Establish a positive raw control before deleting the file: exactly 64
 # distinct marker offsets must be readable through O_DIRECT. Read errors fail.
-check_mounted
-if ! raw_copy "$RUN/marker.scan"; then die 'cannot read raw device for marker control'; fi
-if ! marker_count=$(LC_ALL=C grep -a -o -F -- 'VANISH_ORACLE@' "$RUN/marker.scan" | wc -l); then
-  rm -f -- "$RUN/marker.scan"
-  die 'marker control scan failed'
-fi
+scan_rc=0
+raw_copy "$RUN/marker.scan" yes
+marker_count=$(LC_ALL=C grep -a -o -F -- 'VANISH_ORACLE@' "$RUN/marker.scan" | wc -l) || scan_rc=$?
 rm -f -- "$RUN/marker.scan"
+[[ $scan_rc == 0 || $scan_rc == 1 ]] || die "marker control scan failed (rc=$scan_rc)"
 [[ $marker_count == 64 ]] || die "expected 64 marker occurrences, got $marker_count"
 printf 'verified: %s markers\n' "$marker_count" > "$RUN/marker.control"
 expect 0 '6: marker file' "$V" "$WORK/marker.bin"
 gone "$WORK/marker.bin" '6: file'
+
+# Case 7: freespace must erase blocks of a file deleted with plain rm.
+head -c 2097152 /dev/urandom > "$WORK/freemark.bin"
+for ((off=0; off<2097152; off+=16384)); do
+  printf 'VANISH_ORACLE@%08x' "$off" | dd of="$WORK/freemark.bin" bs=1 seek="$off" conv=notrunc status=none
+done
+sync
+check_mounted
+scan_rc=0
+raw_copy "$RUN/freemark.scan" yes
+free_count=$(LC_ALL=C grep -a -o -F -- 'VANISH_ORACLE@' "$RUN/freemark.scan" | wc -l) || scan_rc=$?
+rm -f -- "$RUN/freemark.scan"
+[[ $scan_rc == 0 || $scan_rc == 1 ]] || die "freespace control scan failed (rc=$scan_rc)"
+[[ $free_count == 128 ]] || die "expected 128 freespace marker occurrences, got $free_count"
+printf 'verified: %s freespace markers\n' "$free_count" >> "$RUN/marker.control"
+rm -- "$WORK/freemark.bin"
+sync
+check_cases
+expect 0 '7: freespace 4MiB after plain rm' "$V" freespace "$WORK" --size 4194304
+
 check_cases
 remaining=$(find "$WORK" -mindepth 1 -print -quit)
 if [[ -n $remaining ]]; then step FAIL 'unexpected entries/tails remain in cases'; fail=1; fi

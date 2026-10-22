@@ -31,6 +31,10 @@
             "type": ["string", "null"],
             "enum": ["hdd_overwrite", "overwrite_dealloc", "ram_unlink", "cow_accept", "planned", "disabled", null]
           },
+          "guarantee_level": {
+            "enum": ["G0", "G1", "G3", "content-only", "none"],
+            "doc": "Достигнутый уровень для цели; G2/G4/G5 не заявляются. none — план/отказ/ошибка/пропуск"
+          },
           "status": { "enum": ["ok", "skipped", "rejected", "failed"] },
           "reason": { "type": ["string", "null"] },
           "bytes": { "type": "integer", "minimum": 0, "doc": "сумма длин фактически перезаписанных extents; 0 для плана, ram_unlink/cow_accept и не начатых целей" },

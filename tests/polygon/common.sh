@@ -63,11 +63,18 @@ check_loop() {
   [[ $LOOP =~ ^/dev/loop[0-9]+$ && -b "$LOOP" && ! -L "$LOOP" ]] || die 'invalid loop device'
   [[ $(losetup --noheadings --raw --output BACK-FILE "$LOOP") == "$IMG" ]] || die 'loop backing path changed'
   [[ $(losetup --noheadings --raw --output BACK-INO "$LOOP") == "$(stat -c %i -- "$IMG")" ]] || die 'loop backing inode changed'
-  [[ $(losetup --noheadings --raw --output BACK-MAJ:MIN "$LOOP") == "$(stat -c %Hd:%Ld -- "$IMG")" ]] || die 'loop backing filesystem changed'
+  # Do not compare BACK-MAJ:MIN with findmnt: util-linux may report it empty and
+  # btrfs st_dev can differ from mountinfo MAJ:MIN. Path + inode + size above
+  # already pin the exact backing file object.
   [[ $(losetup --noheadings --raw --output OFFSET "$LOOP") == 0 ]] || die 'unexpected loop offset'
   [[ $(losetup --noheadings --raw --output SIZELIMIT "$LOOP") == 0 ]] || die 'unexpected loop size limit'
   [[ $(blockdev --getsize64 "$LOOP") == "$(stat -c %s -- "$IMG")" ]] || die 'loop size differs from image size'
-  DEVNUM=$(stat -c %Hr:%Lr -- "$LOOP")
+  # findmnt prints decimal major:minor; stat %t/%T give st_rdev in hex.
+  local maj_hex min_hex
+  maj_hex=$(stat -c %t -- "$LOOP")
+  min_hex=$(stat -c %T -- "$LOOP")
+  [[ $maj_hex =~ ^[0-9a-fA-F]+$ && $min_hex =~ ^[0-9a-fA-F]+$ ]] || die 'cannot read loop device numbers'
+  DEVNUM=$(printf '%d:%d' "0x$maj_hex" "0x$min_hex")
 }
 check_unmounted() {
   local mounts
@@ -103,13 +110,37 @@ unmount_owned() {
   check_loop
   check_unmounted
 }
-# Copy the unmounted loop device through O_DIRECT so the scan cannot be served
-# from the page cache. Any read error is fatal, never "not found".
-raw_copy() {
-  local out=$1
-  [[ ! -e "$out" && ! -L "$out" ]] || die "refusing to overwrite raw copy: $out"
+# Unmount every mount whose source is exactly this run's loop. The desktop
+# automounter may mount the disposable image at /run/media/<user>/<uuid> after
+# finalize; that is still our loop, never an unrelated filesystem. Verify the
+# device number before each unmount and never touch /.
+unmount_all_owned() {
+  check_loop
+  local rows maj target
+  rows=$(findmnt --raw --noheadings --source "$LOOP" --output MAJ:MIN,TARGET) || die 'cannot enumerate owned loop mounts'
+  while read -r maj target; do
+    [[ -n ${maj:-} ]] || continue
+    [[ $maj == "$DEVNUM" ]] || die "unexpected mount identity for $LOOP: $maj"
+    [[ $target == / ]] && die 'refusing to unmount root'
+    printf 'unmounting owned loop from %s\n' "$target" >&2
+    umount -- "$target" || die "unmount failed: $target"
+  done <<< "$rows"
   check_loop
   check_unmounted
+}
+# Copy the loop device through O_DIRECT so the scan cannot be served from the
+# page cache. Any read error is fatal, never "not found". The default requires
+# an unmounted device; pass 'mounted' for the positive control that runs while
+# the freshly synced filesystem is still mounted.
+raw_copy() {
+  local out=$1 mounted=${2:-no}
+  [[ ! -e "$out" && ! -L "$out" ]] || die "refusing to overwrite raw copy: $out"
+  check_loop
+  if [[ $mounted == yes ]]; then
+    check_mounted
+  else
+    check_unmounted
+  fi
   dd if="$LOOP" of="$out" bs=1M iflag=direct status=none || die 'raw read failed'
 }
 # Count marker occurrences (not lines: binary data may contain no newlines).

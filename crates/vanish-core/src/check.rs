@@ -10,9 +10,9 @@ use std::os::unix::fs::MetadataExt;
 
 use crate::config::Options;
 use crate::error::Result;
-use crate::fsinfo::VolumeInfo;
+use crate::fsinfo::{DeviceKind, EncryptionState, JournalState, VolumeInfo};
 use crate::platform::{Opener, Platform, SwapEntry};
-use crate::strategy::decide;
+use crate::strategy::{decide, Strategy};
 
 #[derive(Debug, Serialize)]
 pub struct CheckEntry {
@@ -24,6 +24,9 @@ pub struct CheckEntry {
     pub volume: Option<VolumeInfo>,
     pub openers: Vec<Opener>,
     pub hardlink_refusal: bool,
+    /// Highest sanitization level this path could reach with the given Options.
+    pub guarantee_ceiling: String,
+    pub guarantee_notes: Vec<String>,
     pub verdict: String,
 }
 
@@ -58,6 +61,8 @@ pub fn run(
                 volume: None,
                 openers: Vec::new(),
                 hardlink_refusal: false,
+                guarantee_ceiling: "none".into(),
+                guarantee_notes: Vec::new(),
                 verdict: format!("проверка не удалась: {}: {}", error.kind(), error),
             }),
         }
@@ -80,6 +85,8 @@ fn check_one(plat: &dyn Platform, p: &Path, opts: &Options) -> Result<CheckEntry
         volume: None,
         openers: Vec::new(),
         hardlink_refusal: false,
+        guarantee_ceiling: "none".into(),
+        guarantee_notes: Vec::new(),
         verdict: String::new(),
     };
     let md = match std::fs::symlink_metadata(p) {
@@ -106,6 +113,9 @@ fn check_one(plat: &dyn Platform, p: &Path, opts: &Options) -> Result<CheckEntry
     let (dev, ino, nlink) = (md.dev(), md.ino(), md.nlink());
     if md.is_dir() {
         e.kind = "dir".into();
+        e.guarantee_ceiling = "G0".into();
+        e.guarantee_notes
+            .push("каталог: удаляется только имя; содержимое обрабатывается отдельно".into());
     } else {
         e.kind = "file".into();
         e.size = Some(md.len());
@@ -125,9 +135,34 @@ fn check_one(plat: &dyn Platform, p: &Path, opts: &Options) -> Result<CheckEntry
             None
         }
     };
+    let mut plan: Option<Strategy> = None;
     if let Some(volume) = &volume {
-        if let Err(error) = decide(md.is_file(), volume, opts) {
-            refusals.push(format!("{}: {}", error.kind(), error));
+        match decide(md.is_file(), volume, opts) {
+            Ok(strategy) => plan = Some(strategy),
+            Err(error) => refusals.push(format!("{}: {}", error.kind(), error)),
+        }
+        if md.is_file() {
+            e.guarantee_ceiling = ceiling_for(plan, volume).into();
+            if matches!(volume.journal, JournalState::Active) {
+                e.guarantee_notes
+                    .push("журнал ФС может сохранять имена и метаданные".into());
+            }
+            if matches!(plan, Some(Strategy::CowAccept)) {
+                e.guarantee_notes
+                    .push("COW/снапшоты: старые блоки не гарантированно уничтожены".into());
+            }
+            if matches!(plan, Some(Strategy::RamUnlink)) {
+                e.guarantee_notes
+                    .push("RAM-ФС: физическая чистка носителя этим режимом не доказана".into());
+            }
+            if matches!(volume.device_kind, DeviceKind::Ssd) {
+                e.guarantee_notes
+                    .push("SSD/FTL: физическое санирование чипом не доказано".into());
+            }
+            if matches!(volume.encrypted, EncryptionState::Encrypted) {
+                e.guarantee_notes
+                    .push("шифрование тома не равнозначно crypto-erase ключей".into());
+            }
         }
     }
     match plat.openers(dev, ino) {
@@ -161,4 +196,21 @@ fn check_one(plat: &dyn Platform, p: &Path, opts: &Options) -> Result<CheckEntry
     };
     e.volume = volume;
     Ok(e)
+}
+
+/// Ceiling for a file given the planned strategy and volume caveats. G2/G4/G5
+/// are never claimed: journal, COW and device-wide sanitization remain outside
+/// this project's proven scope.
+fn ceiling_for(plan: Option<Strategy>, v: &VolumeInfo) -> &'static str {
+    match plan {
+        None => "none",
+        Some(Strategy::RamUnlink | Strategy::CowAccept) => "content-only",
+        Some(Strategy::HddOverwrite | Strategy::OverwriteDealloc) => {
+            if matches!(v.journal, JournalState::Active | JournalState::Unknown) {
+                "content-only"
+            } else {
+                "G1"
+            }
+        }
+    }
 }

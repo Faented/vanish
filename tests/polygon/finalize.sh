@@ -15,6 +15,7 @@ remaining=$(find "$MNT/cases" -mindepth 1 -print -quit)
 [[ -z $remaining ]] || die 'files/tails remain; refusing a success report'
 REPORT="$RUN/finalize.log"
 (set -o noclobber; : > "$REPORT")
+MODE=$(cat -- "$RUN/mode" 2>/dev/null || printf 'no-journal')
 unmount_owned
 set_status unmounted
 fail=0
@@ -26,6 +27,11 @@ else
 fi
 if raw_absent .vanish-v1- >> "$REPORT"; then
   printf 'PASS: raw plaintext-tail check only\n' | tee -a "$REPORT"
+elif [[ $MODE == with-journal ]]; then
+  # In the journal variant the metadata scan is an expected failure: ext4 may
+  # keep copies of names in the journal. It is reported as a documented limit,
+  # never as a content-clean pass.
+  printf 'EXPECTED-FAIL (with-journal): tail names remain in journal copies\n' | tee -a "$REPORT"
 else
   printf 'FAIL: plaintext tail names remain (including possible ext4 metadata remnants)\n' | tee -a "$REPORT"
   fail=1

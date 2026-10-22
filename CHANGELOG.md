@@ -32,8 +32,28 @@
   не-UTF8 xattr отвергаются; XFS journal консервативно считается Active; нет
   паник на NUL в путях.
 - Зависимости бэкендов стали target-specific; неиспользуемый `thiserror` удалён.
+- Добавлен честный план санитизации G0–G5 (`docs/sanitization-plan.md`),
+  организация полигона и полные прогоны loop-ext4 256 МиБ:
+  без журнала — 7/7, raw 0 маркеров/хвостов, PhotoRec `Total: 0 files found`
+  (G1+G3); с журналом — 7/7, content-маркеры 0 и PhotoRec 0, но имена-хвосты
+  остаются в журнале (content-only, G2 не достигнут). Это не обещание
+  физической невосстановимости.
+- В wipe-отчёт добавлен `guarantee_level` (`G0/G1/G3/content-only/none`), в
+  `check` — `guarantee_ceiling` и `guarantee_notes`. G1 заявляется только при
+  достоверно отсутствующем журнале; Active/Unknown журнал, COW и tmpfs дают
+  `content-only`. G2/G4/G5 не заявляются.
+- Linux backend: read-only `preflight` блочного устройства (`/sys`, mountinfo,
+  swaps, holders/slaves, boot-связь) без `open`/ioctl; исполнение остаётся
+  заблокированным. `device --dry-run` показывает preflight и blockers.
+  Mount-строки сопоставляются по maj:min и по source-пути (btrfs `[/subvol]`),
+  членство в btrfs определяется через `/sys/fs/btrfs/*/devices`.
 - Уточнение к исторической записи v1.0: recovery-tail — 16 случайных hex,
   не 12 hex от SHA-256 имени.
+- Добавлен `docs/sanitization-plan.md`: честные уровни гарантий G0–G5 и дорожная
+  карта к device-режиму. Полигон усилен: оркестратор `run_all.sh`, freespace-кейс
+  с положительным контролем, вариант `--with-journal` (ожидаемый провал имён),
+  автоматизированный PhotoRec, исправлены hex/dec-сравнение backing-устройства,
+  обработка rc сканов и уборка частичного prepare.
 - Уточнены ограничения и отозваны универсальные обещания невосстановимости:
   см. `docs/security-hardening.md`. Нижеследующие записи — история, не текущая
   гарантия безопасности.

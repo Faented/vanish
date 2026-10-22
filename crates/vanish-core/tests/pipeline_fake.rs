@@ -196,6 +196,40 @@ fn check_uses_supplied_options_for_strategy_verdict() {
 }
 
 #[test]
+fn check_exposes_guarantee_ceiling_and_journal_note() {
+    let fixture = Fixture::new();
+    let file = fixture.file("file");
+    let shared = store();
+    let plat = FakePlatform {
+        store: shared.clone(),
+        openers_list: vec![],
+    };
+    let report =
+        vanish_core::check::run(&plat, std::slice::from_ref(&file), &Options::default()).unwrap();
+    assert_eq!(report.entries[0].guarantee_ceiling, "G1");
+    assert!(report.entries[0]
+        .guarantee_notes
+        .iter()
+        .any(|note| note.contains("SSD")));
+
+    let mut volume = plat.info();
+    volume.journal = JournalState::Active;
+    shared.lock().unwrap().volume = Some(volume);
+    let report =
+        vanish_core::check::run(&plat, std::slice::from_ref(&file), &Options::default()).unwrap();
+    assert_eq!(report.entries[0].guarantee_ceiling, "content-only");
+    assert!(report.entries[0]
+        .guarantee_notes
+        .iter()
+        .any(|note| note.contains("журнал")));
+
+    let report =
+        vanish_core::check::run(&plat, std::slice::from_ref(&fixture.0), &Options::default())
+            .unwrap();
+    assert_eq!(report.entries[0].guarantee_ceiling, "G0");
+}
+
+#[test]
 fn check_preserves_hardlink_and_busy_refusals_alongside_strategy_refusal() {
     let fixture = Fixture::new();
     let file = fixture.file("file");
@@ -543,12 +577,33 @@ fn pipeline_overwrite_unlink_and_reports() {
     let ev = &report.targets[0];
     assert_eq!(ev.status, "ok");
     assert_eq!(ev.strategy.as_deref(), Some("overwrite_dealloc"));
+    assert_eq!(ev.guarantee_level, "G1");
     assert_eq!(ev.bytes, 40960);
     assert!(ev.tail.is_some());
     // инвариант 7: имя исходного файла не попадает в отчёт
     assert!(!serde_json::to_string(&report).unwrap().contains("doc.bin"));
     // инвариант 8: перезаписанное содержимое НЕ осталось (truncate-0 после записей)
     // (данные удалены из fake-storeunlink'ом)
+}
+
+#[test]
+fn pipeline_marks_journaled_overwrite_content_only() {
+    let shared = store();
+    let plat = FakePlatform {
+        store: shared.clone(),
+        openers_list: vec![],
+    };
+    let mut volume = plat.info();
+    volume.journal = JournalState::Active;
+    shared.lock().unwrap().volume = Some(volume);
+    let (report, result) = wipe_one(shared.clone(), "journaled.bin", 8192, &base_opts(), vec![]);
+    result.expect("wipe на ext4 с журналом должен завершиться");
+    let event = &report.targets[0];
+    assert_eq!(event.guarantee_level, "content-only");
+    assert!(event
+        .guarantees
+        .as_ref()
+        .is_some_and(|g| g.journal_contains_old_names));
 }
 
 #[test]
@@ -696,6 +751,10 @@ fn dry_run_tree_reports_planned_directories_not_non_empty_skips() {
         .reason
         .as_deref()
         .is_some_and(|r| r.contains("не пуст"))));
+    assert!(report
+        .targets
+        .iter()
+        .all(|event| event.guarantee_level == "none"));
     assert!(root.join("sub/child.bin").exists());
 }
 
@@ -1038,6 +1097,9 @@ fn directory_rename_is_durable_before_rmdir() {
             .wipe_dir(Target::from_parts("/fake/dir".into(), 1, 2, 0, 2));
         assert_eq!(result.is_err(), fail_at.is_some());
         assert_eq!(report.ok, usize::from(fail_at.is_none()));
+        if fail_at.is_none() {
+            assert_eq!(report.targets[0].guarantee_level, "G0");
+        }
         let events = shared.lock().unwrap().events.clone();
         if fail_at == Some(1) {
             assert_eq!(events, ["fsinfo", "rename", "fsync_dir"]);
