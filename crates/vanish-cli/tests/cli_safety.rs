@@ -233,6 +233,70 @@ fn device_execution_is_disabled_and_preserves_regular_file() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn device_loop_wipe_requires_matching_confirmation_before_any_access() {
+    let root = fixture();
+    let supplied = root.join("not-a-device");
+    let other = root.join("other");
+    fs::write(&supplied, b"keep").unwrap();
+    fs::write(&other, b"other").unwrap();
+    let output = run(&[
+        "device",
+        supplied.to_str().unwrap(),
+        "--device-wipe-loop",
+        "--confirm-device",
+        other.to_str().unwrap(),
+    ]);
+    assert_exit(&output, 2);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not match"));
+    assert_eq!(fs::read(&supplied).unwrap(), b"keep");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn device_loop_wipe_rejects_regular_file_after_matching_confirmation() {
+    let root = fixture();
+    let supplied = root.join("not-a-device");
+    fs::write(&supplied, b"keep").unwrap();
+    let output = run(&[
+        "device",
+        supplied.to_str().unwrap(),
+        "--device-wipe-loop",
+        "--confirm-device",
+        supplied.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_exit(&output, 4);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"failed\": 1"),
+        "expected a failed target report"
+    );
+    assert_eq!(fs::read(&supplied).unwrap(), b"keep");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn device_loop_wipe_flags_stay_read_only_in_dry_run() {
+    let root = fixture();
+    let supplied = root.join("not-a-device");
+    fs::write(&supplied, b"keep").unwrap();
+    let output = run(&[
+        "device",
+        supplied.to_str().unwrap(),
+        "--dry-run",
+        "--device-wipe-loop",
+        "--confirm-device",
+        supplied.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_exit(&output, 3);
+    assert_eq!(fs::read(&supplied).unwrap(), b"keep");
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn overlapping_targets_are_rejected_before_deletion() {
     let root = fixture();

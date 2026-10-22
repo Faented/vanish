@@ -75,6 +75,12 @@ struct Cli {
     xdev: bool,
     #[arg(long, global = true)]
     recovery_scan: bool,
+    /// destructive loop-only device wipe (requires --confirm-device)
+    #[arg(long, global = true)]
+    device_wipe_loop: bool,
+    /// exact device path typed as consent for --device-wipe-loop
+    #[arg(long, global = true, value_name = "PATH")]
+    confirm_device: Option<PathBuf>,
     /// freespace limit in bytes (default: 95% of available space)
     #[arg(long, global = true)]
     size: Option<u64>,
@@ -131,6 +137,17 @@ impl Cli {
         }
         if self.size.is_some() && !matches!(self.cmd, Some(Cmd::Freespace { .. })) {
             return Err("--size допустим только с подкомандой freespace".into());
+        }
+        if self.device_wipe_loop || self.confirm_device.is_some() {
+            if !matches!(self.cmd, Some(Cmd::Device { .. })) {
+                return Err(
+                    "--device-wipe-loop/--confirm-device допустимы только с подкомандой device"
+                        .into(),
+                );
+            }
+            if !self.device_wipe_loop || self.confirm_device.is_none() {
+                return Err("--device-wipe-loop требует --confirm-device <PATH>".into());
+            }
         }
         Ok(Options {
             passes,
@@ -841,9 +858,37 @@ fn freespace_mode(dir: PathBuf, cli: &Cli, opts: &Options) -> u8 {
     finish_run(report, 3, cli, sink)
 }
 
-fn device_mode(dev: PathBuf, cli: &Cli) -> u8 {
-    // Device execution is deliberately disabled. In particular, this branch does
-    // not stat, open, ioctl, mount-check, or prompt for the supplied device.
+fn device_mode(dev: PathBuf, cli: &Cli, opts: &Options) -> u8 {
+    let execute = cli.device_wipe_loop && !cli.dry_run;
+    if execute {
+        // Consent is checked before any report creation or device open. The
+        // comparison is canonical so a different spelling of the same device is
+        // accepted only if it resolves to the same object.
+        let Some(confirm) = cli.confirm_device.as_deref() else {
+            eprintln!("device wipe refused: --confirm-device is required");
+            return 2;
+        };
+        let confirmed = match std::fs::canonicalize(confirm) {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("device wipe refused: confirmation path cannot be resolved");
+                return 2;
+            }
+        };
+        let target = match std::fs::canonicalize(&dev) {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("device wipe refused: target device cannot be resolved");
+                return 2;
+            }
+        };
+        if confirmed != target {
+            eprintln!("device wipe refused: --confirm-device does not match the target device");
+            return 2;
+        }
+    }
+    // Device execution is disabled unless both explicit consent flags are
+    // present. This branch otherwise does not open or ioctl the device.
     if cli
         .report
         .as_deref()
@@ -927,6 +972,56 @@ fn device_mode(dev: PathBuf, cli: &Cli) -> u8 {
             &dev,
             "dry-run: device execution disabled; read-only preflight unsupported on this platform",
         );
+        finish_run(report, 3, cli, sink)
+    } else if execute {
+        #[cfg(target_os = "linux")]
+        {
+            let wipe_options = be::DeviceWipeOptions {
+                passes: opts.passes,
+                pattern: opts.pattern,
+                verify: opts.verify,
+            };
+            match be::device_wipe_loop(&dev, &wipe_options) {
+                Ok(result) => {
+                    report.push(TargetEvent {
+                        kind: "device".into(),
+                        name_hash: vanish_core::util::name_sha256(&dev),
+                        tail: None,
+                        strategy: Some("loop_overwrite".into()),
+                        status: "ok".into(),
+                        reason: Some(
+                            "loop-only overwrite completed; physical erase not guaranteed".into(),
+                        ),
+                        bytes: result.bytes_written,
+                        warnings: vec![
+                            "loop backing may be COW/sparse; physical erase not proven".into(),
+                            format!("passes: {}", result.passes),
+                        ],
+                        guarantee_level: "content-only".into(),
+                        guarantees: None,
+                        elapsed_ms: 0,
+                    });
+                    finish_run(report, 0, cli, sink)
+                }
+                Err(error) => {
+                    let platform = make_platform();
+                    let mut pipe =
+                        vanish_core::pipeline::Pipeline::new(platform.as_ref(), opts, &mut report);
+                    pipe.record_error("device", &dev, &error);
+                    finish_run(report, 4, cli, sink)
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            record_rejection(
+                &mut report,
+                "device",
+                &dev,
+                "device execution unsupported on this platform",
+            );
+            finish_run(report, 4, cli, sink)
+        }
     } else {
         record_rejection(
             &mut report,
@@ -934,8 +1029,8 @@ fn device_mode(dev: PathBuf, cli: &Cli) -> u8 {
             &dev,
             "device execution disabled; no device access performed",
         );
+        finish_run(report, 3, cli, sink)
     }
-    finish_run(report, 3, cli, sink)
 }
 
 fn recovery_mode(roots: Vec<PathBuf>, cli: &Cli, opts: &Options) -> u8 {
@@ -1071,7 +1166,7 @@ fn main() -> ExitCode {
     let code = match &cli.cmd {
         Some(Cmd::Check { paths }) => check_mode(paths, &cli, &opts),
         Some(Cmd::Freespace { dir }) => freespace_mode(dir.clone(), &cli, &opts),
-        Some(Cmd::Device { dev }) => device_mode(dev.clone(), &cli),
+        Some(Cmd::Device { dev }) => device_mode(dev.clone(), &cli, &opts),
         Some(Cmd::Recovery { roots }) => recovery_mode(roots.clone(), &cli, &opts),
         None if cli.recovery_scan => recovery_mode(cli.targets.clone(), &cli, &opts),
         None if cli.targets.is_empty() => {
@@ -1168,6 +1263,36 @@ mod tests {
             safety_refuse(Path::new("/proc"), &opts),
             Some("protected filesystem")
         );
+    }
+
+    #[test]
+    fn device_wipe_flags_require_device_scope_and_pairing() {
+        let cli = Cli::try_parse_from([
+            "vanish",
+            "/tmp/opencode/target",
+            "--device-wipe-loop",
+            "--confirm-device",
+            "/dev/loop0",
+        ])
+        .expect("arguments parse");
+        let error = cli.opts().expect_err("flags outside device");
+        assert!(error.contains("только с подкомандой device"), "{error}");
+
+        let cli = Cli::try_parse_from(["vanish", "device", "/dev/loop0", "--device-wipe-loop"])
+            .expect("arguments parse");
+        let error = cli.opts().expect_err("missing confirmation");
+        assert!(error.contains("--confirm-device"), "{error}");
+
+        let cli = Cli::try_parse_from([
+            "vanish",
+            "device",
+            "/dev/loop0",
+            "--confirm-device",
+            "/dev/loop0",
+        ])
+        .expect("arguments parse");
+        let error = cli.opts().expect_err("confirmation without wipe flag");
+        assert!(error.contains("--device-wipe-loop"), "{error}");
     }
 
     #[cfg(target_os = "linux")]

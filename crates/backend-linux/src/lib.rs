@@ -1,5 +1,6 @@
 //! backend-linux: реализация контракта vanish-core поверх syscall.
 
+mod device_loop;
 mod preflight;
 mod sys;
 #[cfg(test)]
@@ -932,6 +933,7 @@ pub use wipe_handle::LinuxWipeHandle;
 
 // ---------- device helpers (vanish device) ----------
 
+pub use device_loop::{device_wipe_loop, DeviceWipeOptions};
 pub use preflight::{preflight, DevicePreflight};
 
 pub struct DeviceResult {
@@ -939,6 +941,8 @@ pub struct DeviceResult {
     pub size: u64,
     pub method: &'static str,
     pub physical_guaranteed: bool,
+    pub passes: u8,
+    pub bytes_written: u64,
 }
 
 /// Temporarily disabled: no path lookup, open, or destructive ioctl is permitted.

@@ -46,6 +46,10 @@ pub struct DevicePreflight {
     pub holders: Vec<String>,
     /// Entry names from `/sys/dev/block/M:m/slaves`.
     pub slaves: Vec<String>,
+    /// Whether this is a loop device with a readable backing file.
+    pub is_loop: bool,
+    /// Backing file reported by `/sys/dev/block/M:m/loop/backing_file`.
+    pub loop_backing_file: Option<PathBuf>,
     /// Always `false`: destructive device execution is still disabled.
     pub execution_allowed: bool,
     /// Stable reasons why execution is blocked. Always contains
@@ -112,6 +116,9 @@ pub(crate) fn preflight_with(
 
     let holders = read_sysfs_names(&sysfs_device.join("holders"))?;
     let slaves = read_sysfs_names(&sysfs_device.join("slaves"))?;
+    let loop_backing_file =
+        read_optional_text(&sysfs_device.join("loop/backing_file"))?.map(PathBuf::from);
+    let is_loop = loop_backing_file.is_some();
 
     let boot_related = boot_related_mounts(&rows, &sysfs_root, &sysfs_device, major, minor);
     let boot_relation_known = boot_related.is_some();
@@ -151,6 +158,8 @@ pub(crate) fn preflight_with(
         boot_related,
         holders,
         slaves,
+        is_loop,
+        loop_backing_file,
         execution_allowed: false,
         blockers,
     })
@@ -177,6 +186,16 @@ fn read_text_file(path: &Path) -> io::Result<String> {
     let bytes = fs::read(path)?;
     String::from_utf8(bytes)
         .map_err(|_| invalid_data(format!("non-UTF-8 file: {}", path.display())))
+}
+
+fn read_optional_text(path: &Path) -> io::Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(|text| Some(text.trim().to_string()))
+            .map_err(|_| invalid_data(format!("non-UTF-8 file: {}", path.display()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn read_required_u64(path: &Path) -> io::Result<u64> {

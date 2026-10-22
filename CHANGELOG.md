@@ -5,6 +5,11 @@
 ## Unreleased — исправления аудита
 
 - Временно заблокировано исполнение `device`; dry-run остаётся read-only планом.
+- M5: destructive-исполнение только для loop-устройства и только с явными
+  `--device-wipe-loop --confirm-device <PATH>` (canonical match, `O_EXCL`,
+  identity/`BLKGETSIZE64`/`BLKROGET`, multipass + replay verify). Успех —
+  `content-only`, `physical_guaranteed=false`; реальные диски и обычный вызов
+  `device` остаются заблокированы. Добавлен `tests/polygon/run_device_loop.sh`.
 - SIGINT заканчивает текущий файл; исправляются обязательные sync/unlink,
   классификация verify-ошибок и учёт recovery/CLI failures.
 - Устранены изменения целей при dry-run freespace и небезопасная перезапись

@@ -107,7 +107,7 @@ dist/vanish --dry-run freespace /data --size 1048576
 dist/vanish freespace /data --size 1048576
 dist/vanish recovery /path               # повторная обработка хвостов
 dist/vanish --recovery-scan /path
-dist/vanish device /dev/sdX --dry-run     # только план, без открытия устройства
+dist/vanish device /dev/sdX --dry-run     # только preflight, без open/ioctl
 ```
 
 Без `--size` freespace использует бюджет 95% доступного места. Это может
@@ -116,10 +116,16 @@ dist/vanish device /dev/sdX --dry-run     # только план, без отк
 ошибку аргументов. Заполнение свободного места на COW/SSD не доказывает
 перезапись старых физических блоков. При ошибке записи или SIGINT
 скретч-файл удаляется (в том числе fallback-unlink, если wipe-конвейер уже
-отказал); гарантий при SIGKILL/потере питания нет. `device` возвращает отказ
-(`3`); при `--dry-run` выполняется только read-only preflight (метаданные,
-`/sys`, mountinfo, swaps — без `open`/ioctl) и перечисляются блокеры, но
-исполнение запрещено.
+отказал); гарантий при SIGKILL/потере питания нет. `device` по умолчанию
+возвращает отказ (`3`); при `--dry-run` выполняется только read-only preflight
+(метаданные, `/sys`, mountinfo, swaps — без `open`/ioctl) и перечисляются
+блокеры. Destructive-исполнение разрешено **только для loop-устройства** и
+только при одновременных `--device-wipe-loop --confirm-device <PATH>`; путь
+подтверждения должен канонически совпадать с устройством, иначе код `2` до
+открытия. Успех — код `0`, `guarantee_level=content-only`,
+`physical_guaranteed=false`: перезаписывается loop-backing файл, но физическое
+уничтожение и COW/sparse-копии не доказываются. Для реальных дисков execution
+остаётся заблокированным.
 
 При SIGINT текущий файл полностью заканчивается, включая оставшиеся экстенты
 и проходы; следующие цели не начинаются. Для большого файла ожидание может

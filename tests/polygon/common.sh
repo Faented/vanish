@@ -116,15 +116,17 @@ unmount_owned() {
 # device number before each unmount and never touch /.
 unmount_all_owned() {
   check_loop
-  local rows maj target
-  rows=$(findmnt --raw --noheadings --source "$LOOP" --output MAJ:MIN,TARGET) || die 'cannot enumerate owned loop mounts'
+  local all maj target
+  # Enumerate mounts independently of --source: findmnt exits 1 when the loop
+  # is not mounted at all, which is a normal post-M5 state, not an error.
+  all=$(findmnt --raw --noheadings --output MAJ:MIN,TARGET) || die 'cannot enumerate mounts'
   while read -r maj target; do
     [[ -n ${maj:-} ]] || continue
-    [[ $maj == "$DEVNUM" ]] || die "unexpected mount identity for $LOOP: $maj"
+    [[ $maj == "$DEVNUM" ]] || continue
     [[ $target == / ]] && die 'refusing to unmount root'
     printf 'unmounting owned loop from %s\n' "$target" >&2
     umount -- "$target" || die "unmount failed: $target"
-  done <<< "$rows"
+  done <<< "$all"
   check_loop
   check_unmounted
 }

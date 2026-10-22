@@ -34,7 +34,8 @@ xattr- и журнальные копии, remapped sectors HDD — это св�
   имена-хвосты остаются в журнале. Это зафиксированная граница, а не G2.
 - **G3** — freespace реализован; полигон-кейс 7 пройден на ext4 без журнала и
   с журналом (content-маркеры после `rm` исчезают).
-- **G4/G5** — device-режим ЗАБЛОКИРОВАН в CLI и backend до выполнения чек-листа.
+- **G4/G5** — device-исполнение ограничено **loop-only** (M5): реальные диски
+  по-прежнему заблокированы, G4 для них не заявляется; G5 отсутствует.
 - Заявлять можно максимум G1(+G3) для файлов на проверенном loop-ext4 без
   журнала; с журналом — только content-санитизацию с оговоркой об именах.
   Для остальных ФС/носителей — только после отдельных прогонов.
@@ -105,6 +106,22 @@ sudo bash tests/polygon/teardown.sh   # уборка после каждого �
   отказ; текущий код их не выполняет.
 - Логи остаются в `/var/lib/vanish-polygon/run.6dXxJcQWPulA` (root-only).
 
+### Результат M5 loop-полигона (2026-10-22)
+
+- `run.X65NbvKtXYM5`: loop-устройство 256 МиБ, запуск
+  `run_device_loop.sh target/release/vanish --passes 1 --verify --auto-photorec`.
+- Перед wipe сырой O_DIRECT-контроль нашёл ровно 64 маркера `VANISH_ORACLE`.
+- Consent-вызов `vanish device <loop> --device-wipe-loop --confirm-device <loop>`
+  завершился `PASS (full, loop-only)`, код 0.
+- После wipe O_DIRECT-скан: 0 маркеров; PhotoRec 7.2: `Total: 0 files found`,
+  восстановленных файлов нет.
+- Подтверждён только destructive-путь **loop-only** и перезапись всех байт
+  данного образа. `physical_guaranteed=false`: COW/sparse backing, кэши
+  накопителя, реальные HDD/SSD, журналы, снапшоты и уровни G4/G5 этим не
+  доказаны. Реальные диски остаются заблокированы.
+- Полные логи остаются в `/var/lib/vanish-polygon/run.X65NbvKtXYM5`
+  (root-only); после teardown образ удаляется, журналы проверки сохраняются.
+
 ## Дорожная карта
 
 - **M1.** Прогон полигона пользователем (оба варианта), фиксация сводки в
@@ -125,6 +142,13 @@ sudo bash tests/polygon/teardown.sh   # уборка после каждого �
   подтверждение и любой execution относятся к M5/M8; для whole-disk нужен
   учёт дочерних разделов.
 - **M5.** Execution на loop-only: многопроходная перезапись + readback verify.
+  **Выполнено:** destructive-путь доступен только для loop-устройства и только
+  с явными `--device-wipe-loop --confirm-device <PATH>` (canonical match), при
+  `O_EXCL`, проверках `BLKGETSIZE64`/`BLKROGET` и повторном preflight; запись
+  всех байт по проходам, `fdatasync`+`BLKFLSBUF`, опциональный детерминированный
+  replay-verify. Успех — `content-only`, `physical_guaranteed=false`. Полигон:
+  `tests/polygon/run_device_loop.sh` (запускает пользователь). Реальные диски
+  остаются заблокированы; это не G4/G5.
 - **M6.** Транспорты: NVMe sanitize ioctl, ATA через hdparm, BLKSECDISCARD;
   обработка frozen/timeout; «прерванный sanitize = неизвестное состояние».
 - **M7.** Железные прогоны пользователя на одноразовых USB/HDD/NVMe по
